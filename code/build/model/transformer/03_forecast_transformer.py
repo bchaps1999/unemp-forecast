@@ -65,13 +65,22 @@ def period_to_date(period):
 def load_pytorch_model_and_params(model_dir: Path, processed_data_dir: Path, device):
     """Loads the PyTorch model, parameters, and metadata."""
     print(f"Loading model artifacts from: {model_dir}")
-    # Use hardcoded filenames or get from config if defined there
-    model_path = model_dir / "transformer_model.pt"
+    # Use the checkpoint name saved during training
+    model_path = model_dir / "best_model_val_loss.pt" # Changed filename
     params_path = model_dir / "model_params.pkl"
     metadata_path = processed_data_dir / config.METADATA_FILENAME # Use config
 
-    if not model_path.exists() or not params_path.exists():
-        raise FileNotFoundError(f"Missing model or params file in {model_dir}")
+    if not model_path.exists():
+        # Try the old name as a fallback? Or just error. Let's error for clarity.
+        # old_model_path = model_dir / "transformer_model.pt"
+        # if old_model_path.exists():
+        #     print(f"Warning: '{model_path.name}' not found, falling back to '{old_model_path.name}'.")
+        #     model_path = old_model_path
+        # else:
+        raise FileNotFoundError(f"Missing model weights file '{model_path.name}' in {model_dir}")
+
+    if not params_path.exists():
+        raise FileNotFoundError(f"Missing model params file '{params_path.name}' in {model_dir}")
     if not metadata_path.exists():
          raise FileNotFoundError(f"Missing metadata file at {metadata_path}")
 
@@ -733,7 +742,8 @@ def main(): # Removed args
 
     # --- Paths --- Use config paths
     project_root = config.PROJECT_ROOT
-    model_dir = config.TRAIN_OUTPUT_SUBDIR
+    # Point to the specific standard run directory for the model
+    model_dir = config.TRAIN_OUTPUT_SUBDIR / "standard_run" # Append standard_run here
     processed_data_dir = config.PREPROCESS_OUTPUT_DIR
     raw_data_path = config.FORECAST_RAW_DATA_FILE
     output_dir = config.FORECAST_OUTPUT_SUBDIR
@@ -742,7 +752,7 @@ def main(): # Removed args
     forecast_csv_path = output_dir / "transformer_forecast_results.csv"
 
     print(f"Project Root: {project_root}")
-    print(f"Model Dir: {model_dir}")
+    print(f"Model Dir: {model_dir}") # Will now print the standard_run path
     print(f"Processed Data Dir: {processed_data_dir}")
     print(f"Raw Data Path: {raw_data_path}")
     print(f"Output Dir: {output_dir}")

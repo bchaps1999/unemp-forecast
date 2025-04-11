@@ -34,7 +34,7 @@ FULL_DATA_FILENAME = "full_baked.parquet" # New filename for all processed data
 
 # --- 02_train_transformer.py Parameters ---
 # Input directory is PREPROCESS_OUTPUT_DIR
-TRAIN_OUTPUT_SUBDIR = PROJECT_ROOT / "models/transformer_pytorch"
+TRAIN_OUTPUT_SUBDIR = PROJECT_ROOT / "models/transformer_pytorch" # Removed /standard_run
 SEQUENCE_CACHE_DIR_NAME = "sequence_cache_py" # Relative to PREPROCESS_OUTPUT_DIR
 # Add date filtering for training data (applied *after* loading baked data)
 TRAIN_START_DATE = None # "YYYY-MM-DD" or None to use all available data before TRAIN_END_DATE
@@ -58,6 +58,7 @@ MAX_GRAD_NORM = 1.0          # Maximum gradient norm for clipping
 EARLY_STOPPING_PATIENCE = 5  # Epochs to wait before early stopping
 LR_SCHEDULER_FACTOR = 0.5     # Factor to reduce LR by when plateau detected
 LR_SCHEDULER_PATIENCE = 10    # Epochs to wait before reducing LR
+HPT_EPOCHS = 3 # Number of epochs to run during hyperparameter tuning trials
 
 # Training Flags
 REFRESH_MODEL = False # Force retraining even if model exists
@@ -70,6 +71,38 @@ USE_WEIGHTED_LOSS = False # Set to True to use weighted CrossEntropyLoss
 # Use -1 in script logic to detect and set dynamically based on cores
 PARALLEL_WORKERS = -1 # Set to specific number (e.g., 4) or -1 for auto
 
+# --- Hyperparameter Tuning (HPT) Parameters ---
+HPT_N_TRIALS = 50 # Number of trials for Optuna
+HPT_TIMEOUT_SECONDS = None # Optional timeout for the entire study (e.g., 3600 * 6 for 6 hours)
+HPT_STUDY_NAME = "transformer_hpt_study" # Name for the Optuna study database file
+HPT_EPOCHS = 3 # Number of epochs to run *per trial* during HPT (usually fewer than EPOCHS)
+
+# HPT Search Space Definitions
+HPT_SEQ_LEN_MIN = 6
+HPT_SEQ_LEN_MAX = 24
+HPT_EMBED_DIM_OPTIONS = [32, 64, 128]
+HPT_NUM_HEADS_OPTIONS = [2, 4, 8] # Must divide embed_dim
+HPT_FF_DIM_MIN = 32
+HPT_FF_DIM_MAX = 256
+HPT_FF_DIM_STEP = 32
+HPT_NUM_BLOCKS_MIN = 1
+HPT_NUM_BLOCKS_MAX = 4
+HPT_MLP_UNITS_MIN = 16 # For the single layer MLP head example
+HPT_MLP_UNITS_MAX = 128
+HPT_MLP_UNITS_STEP = 16
+HPT_DROPOUT_MIN = 0.0
+HPT_DROPOUT_MAX = 0.3
+HPT_MLP_DROPOUT_MIN = 0.0
+HPT_MLP_DROPOUT_MAX = 0.5
+HPT_LR_MIN = 1e-5
+HPT_LR_MAX = 1e-3
+HPT_BATCH_SIZE_OPTIONS = [32, 64, 128]
+HPT_USE_WEIGHTED_LOSS_OPTIONS = [True, False]
+
+# HPT Pruner Settings
+HPT_PRUNER_STARTUP = 5 # Number of trials before pruning starts
+HPT_PRUNER_WARMUP = 3 # Number of epochs within a trial before pruning can occur
+
 # --- 03_forecast_transformer.py Parameters ---
 # Input directory for baked data is PREPROCESS_OUTPUT_DIR
 # Input directory for model is TRAIN_OUTPUT_SUBDIR
@@ -79,7 +112,7 @@ FORECAST_RAW_DATA_FILE = PROJECT_ROOT / "data/processed/cps_transitions.csv" # F
 # Simulation Parameters
 FORECAST_PERIODS = 24 # Number of periods to forecast ahead
 MC_SAMPLES = 10 # Number of Monte Carlo samples per period
-FORECAST_START_YEAR = 2020 # YYYY or None (defaults to latest in data)
+FORECAST_START_YEAR = 2022 # YYYY or None (defaults to latest in data)
 FORECAST_START_MONTH = 12 # MM or None (defaults to latest in data)
 
 # --- Derived Paths (can be constructed here or in scripts) ---
