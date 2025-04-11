@@ -118,7 +118,7 @@ FORECAST_RAW_DATA_FILE = PROJECT_ROOT / "data/processed/cps_transitions.csv" # F
 # Simulation Parameters
 FORECAST_PERIODS = 24 # Number of periods to forecast ahead
 MC_SAMPLES = 10 # Number of Monte Carlo samples per period
-FORECAST_START_YEAR = 2022 # YYYY or None (defaults to latest in data)
+FORECAST_START_YEAR = 2021 # YYYY or None (defaults to latest in data)
 FORECAST_START_MONTH = 12 # MM or None (defaults to latest in data)
 
 # --- Derived Paths (can be constructed here or in scripts) ---

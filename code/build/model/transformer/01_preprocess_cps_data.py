@@ -118,15 +118,38 @@ def preprocess_data():
             # Ensure emp_state_f1 exists
             if 'emp_state_f1' not in temp_df.columns:
                 raise ValueError("Input data missing required 'emp_state_f1' column from R script.")
-            target_map = {"Employed": 0, "Unemployed": 1, "Not in Labor Force": 2} # Match R script output strings
+            target_map = {"Employed": 0, "Unemployed": 1, "Not in Labor Force": 2} # Canonical names
             temp_df['target_state'] = temp_df['emp_state_f1'].map(target_map).astype('Int32') # Use pandas nullable integer
 
             # 2. Create current_state categorical from pre-cleaned emp_state
-            # Ensure emp_state exists
             if 'emp_state' not in temp_df.columns:
                 raise ValueError("Input data missing required 'emp_state' column from R script.")
-            # Ensure it's categorical with the correct categories for the pipeline
-            temp_df['current_state'] = pd.Categorical(temp_df['emp_state'], categories=target_map.keys())
+
+            # Explicitly map raw emp_state values to the canonical names from target_map keys
+            # This handles potential capitalization inconsistencies in the raw data.
+            # Create a reverse map for easier lookup (value -> canonical key)
+            # Handle potential variations in raw data (e.g., lowercase)
+            raw_to_canonical_map = {
+                'employed': 'Employed',
+                'unemployed': 'Unemployed',
+                'not in labor force': 'Not in Labor Force',
+                'nilf': 'Not in Labor Force', # Handle abbreviation if present
+                # Add the canonical names themselves in case they are already correct
+                'Employed': 'Employed',
+                'Unemployed': 'Unemployed',
+                'Not in Labor Force': 'Not in Labor Force'
+            }
+            # Apply the mapping, converting raw state to lowercase first for robustness
+            temp_df['current_state_canonical'] = temp_df['emp_state'].str.lower().map(raw_to_canonical_map)
+            # Check for any values that didn't map (shouldn't happen if map is comprehensive)
+            if temp_df['current_state_canonical'].isnull().any():
+                unmapped_values = temp_df.loc[temp_df['current_state_canonical'].isnull(), 'emp_state'].unique()
+                print(f"Warning: Unmapped emp_state values found: {unmapped_values}. Setting to 'Not in Labor Force'.")
+                temp_df['current_state_canonical'].fillna('Not in Labor Force', inplace=True)
+
+            # Ensure the final column is categorical with the exact categories from target_map.keys()
+            temp_df['current_state'] = pd.Categorical(temp_df['current_state_canonical'], categories=target_map.keys())
+            temp_df = temp_df.drop(columns=['current_state_canonical'], errors='ignore') # Drop intermediate column
 
             # 3. Ensure numeric types for relevant columns (might be redundant if R saved correctly, but safe)
             numeric_cols = ['age', 'durunemp', 'famsize', 'nchild', 'wtfinl',
@@ -392,7 +415,22 @@ def preprocess_data():
     print(f"Fitting data baked shape: {fit_baked_df.shape}")
     print(f"HPT validation data baked shape: {hpt_baked_df.shape}")
 
-    # --- 6. Save HPT Validation Baked Data ---
+    # --- Combine for Full Baked Data ---
+    print("\nCombining fitting and HPT validation data for the full baked dataset...")
+    full_baked_df = pd.concat([fit_baked_df, hpt_baked_df], ignore_index=True)
+    print(f"Full baked data shape: {full_baked_df.shape}")
+
+    # --- Save Full Baked Data ---
+    print(f"\nSaving full baked data to {full_baked_file}...")
+    try:
+        full_baked_df.to_parquet(full_baked_file, index=False)
+        print(f"Full baked data saved successfully.")
+    except Exception as e:
+        print(f"ERROR saving full baked data: {e}")
+        # Decide if this error should stop the process
+        # return
+
+    # --- 6. Save HPT Validation Baked Data --- # Step number adjusted due to insertion
     print("\n===== STEP 6: Saving HPT Validation Baked Data =====")
     if not hpt_baked_df.empty:
         try:
@@ -403,7 +441,7 @@ def preprocess_data():
     else:
         print("HPT validation data is empty, not saving file.")
 
-    # --- 7. Sample Individuals (from fitting data only) ---
+    # --- 7. Sample Individuals (from fitting data only) --- # Step number adjusted
     print("\n===== STEP 7: Sampling Individuals for Training Splits (from Fitting Data) =====")
     all_person_ids_fit = fit_baked_df['cpsidp'].unique()
     n_all_persons_fit = len(all_person_ids_fit)
@@ -515,9 +553,10 @@ def preprocess_data():
         'val_rows_baked': len(val_data_baked),
         'test_rows_baked': len(test_data_baked),
         'hpt_val_rows_baked': len(hpt_baked_df), # Add count for HPT val set
+        'full_baked_rows': len(full_baked_df), # Add count for the full baked set
         'preprocessing_pipeline_path': str(preprocessor_file),
         'hpt_validation_data_path': str(hpt_val_file) if not hpt_baked_df.empty else None, # Check if df is empty
-        'full_baked_data_path': str(full_baked_file), # Add path to the full data
+        'full_baked_data_path': str(full_baked_file), # Ensure this uses the correct variable
         'weight_column': 'wtfinl' # Add weight column name to metadata
     }
 
