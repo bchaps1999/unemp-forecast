@@ -19,13 +19,13 @@ output_file_param <- "data/processed/cps_transitions.csv"
 # refresh_extract_param: If TRUE, forces a new download request to IPUMS.
 # If FALSE, uses existing downloaded files if they cover the extract date range.
 # Re-processing of the data happens whenever this script is sourced, regardless of this flag.
-refresh_extract_param <- TRUE 
+refresh_extract_param <- FALSE 
 force_scrape_param <- FALSE
 # Dates for the IPUMS extract request
-extract_start_date_param <- "2000-01" 
+extract_start_date_param <- "2005-01" 
 extract_end_date_param <- "2025-03"
 # Dates to subset the downloaded data for processing/analysis
-subset_start_date_param <- "2000-01"
+subset_start_date_param <- "2005-01"
 subset_end_date_param <- "2025-03"
 include_asec_param <- FALSE
 debug_param <- TRUE # Set to TRUE for verbose output during sourced run
@@ -154,7 +154,7 @@ run_cps_pipeline <- function(
   
   # Step 4.5: Add variable labels
   message("\n===== STEP 4.5: Labeling variables =====")
-  final_data <- label_employment_status(final_data)
+  final_data <- label_variables(final_data) 
   
   # Step 5: Save the processed data
   message("\n===== STEP 5: Saving processed data =====")

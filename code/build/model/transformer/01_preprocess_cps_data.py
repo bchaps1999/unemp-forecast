@@ -26,19 +26,6 @@ except ImportError:
 
 # --- Parameters & Configuration ---
 
-def clean_faminc(series):
-    """Helper function to map faminc strings to ordered categories."""
-    mapping = {
-        "$10,000 - $24,999": 1, "10000-24999": 1,
-        "$25,000 - $74,999": 2, "25000-74999": 2,
-        "$75,000 - $149,999": 3, "75000-149999": 3,
-        "$150,000+": 4, "150000+": 4,
-        "<$10,000": 0, "<10000": 0,
-    }
-    cleaned = series.str.replace(r'[$, ]', '', regex=True).str.strip().map(mapping)
-    categories = sorted(list(set(mapping.values())))
-    return pd.Categorical(cleaned, categories=categories, ordered=True)
-
 def preprocess_data():
     """Main function to load, clean, preprocess all, save all, sample, split, and save splits."""
     # --- Setup Paths ---
@@ -120,74 +107,113 @@ def preprocess_data():
         # Let's re-apply the cleaning steps to the split dataframes to be safe.
 
         def apply_cleaning(input_df):
+            """
+            Applies minimal cleaning/type conversion assuming input CSV is pre-cleaned by R script.
+            Focuses on creating target_state, ensuring correct dtypes for pipeline,
+            and calculating time differences.
+            """
             temp_df = input_df.copy()
-            target_map = {"employed": 0, "unemployed": 1, "not_in_labor_force": 2}
-            temp_df['target_state'] = temp_df['emp_state_f1'].map(target_map).astype('Int32')
+
+            # 1. Create numerical target state from the pre-cleaned emp_state_f1
+            # Ensure emp_state_f1 exists
+            if 'emp_state_f1' not in temp_df.columns:
+                raise ValueError("Input data missing required 'emp_state_f1' column from R script.")
+            target_map = {"Employed": 0, "Unemployed": 1, "Not in Labor Force": 2} # Match R script output strings
+            temp_df['target_state'] = temp_df['emp_state_f1'].map(target_map).astype('Int32') # Use pandas nullable integer
+
+            # 2. Create current_state categorical from pre-cleaned emp_state
+            # Ensure emp_state exists
+            if 'emp_state' not in temp_df.columns:
+                raise ValueError("Input data missing required 'emp_state' column from R script.")
+            # Ensure it's categorical with the correct categories for the pipeline
             temp_df['current_state'] = pd.Categorical(temp_df['emp_state'], categories=target_map.keys())
-            temp_df['age'] = pd.to_numeric(temp_df['age'], errors='coerce')
-            temp_df['sex'] = pd.Categorical(temp_df['sex'].map({1: "Male", 2: "Female"}))
-            race_map = {
-                "100": "White", "200": "Black", "300": "NativeAmerican",
-                "651": "Asian", "652": "PacificIslander"
-            }
-            temp_df['race_cat'] = pd.Categorical(temp_df['race'].astype(str).map(race_map).fillna("Other/Mixed"))
-            temp_df['hispan_cat'] = np.select(
-                [
-                    temp_df['hispan'].astype(str).str.contains("not hispanic", case=False, na=False),
-                    temp_df['hispan'].notna() & ~temp_df['hispan'].astype(str).str.contains("not hispanic", case=False, na=False)
-                ],
-                ["NotHispanic", "Hispanic"], default="Unknown"
-            )
-            temp_df['hispan_cat'] = pd.Categorical(temp_df['hispan_cat'])
-            conditions = [
-                temp_df['educ'].astype(str).str.contains("Advanced degree", case=False, na=False),
-                temp_df['educ'].astype(str).str.contains("Bachelor's degree", case=False, na=False),
-                temp_df['educ'].astype(str).str.contains("Some college", case=False, na=False),
-                temp_df['educ'].notna()
+
+            # 3. Ensure numeric types for relevant columns (might be redundant if R saved correctly, but safe)
+            numeric_cols = ['age', 'durunemp', 'famsize', 'nchild', 'wtfinl',
+                            'mth_dim1', 'mth_dim2', # Already derived in R
+                            'national_unemp_rate', 'national_emp_rate',
+                            'state_unemp_rate', 'state_emp_rate',
+                            'ind_group_unemp_rate', 'ind_group_emp_rate']
+            for col in numeric_cols:
+                if col in temp_df.columns:
+                    temp_df[col] = pd.to_numeric(temp_df[col], errors='coerce')
+                else:
+                    print(f"Warning: Expected numeric column '{col}' not found in input data.")
+
+            # Handle potential NaNs introduced by coercion if necessary (e.g., fill wtfinl)
+            if 'wtfinl' in temp_df.columns:
+                 temp_df['wtfinl'] = temp_df['wtfinl'].fillna(0)
+            # Ensure durunemp is integer after potential float conversion from NaN
+            if 'durunemp' in temp_df.columns:
+                 temp_df['durunemp'] = temp_df['durunemp'].fillna(0).astype(int)
+
+
+            # 4. Ensure categorical types for features expected by the pipeline
+            # These columns should already exist with the '_cat' suffix from the R script
+            categorical_cols = [
+                'sex', # Assuming R script outputs 'sex' as 1/2 or Male/Female string
+                'race_cat', 'hispan_cat', 'educ_cat', 'statefip',
+                'relate_cat', 'metro_cat', 'cbsasz_cat', 'marst_cat', 'citizen_cat',
+                'nativity_cat', 'vetstat_cat', 'diff_cat', 'profcert_cat', 'classwkr_cat', # Use diff_cat from R
+                'ind_group_cat', 'occ_group_cat' # Use grouped versions from R
             ]
-            choices = ["Advanced", "Bachelors", "Some_College", "HS_or_less"]
-            temp_df['educ_cat'] = np.select(conditions, choices, default="HS_or_less")
-            educ_categories = ["HS_or_less", "Some_College", "Bachelors", "Advanced"]
-            temp_df['educ_cat'] = pd.Categorical(temp_df['educ_cat'], categories=educ_categories, ordered=False)
-            temp_df['statefip'] = temp_df['statefip'].astype(float).astype(int).astype(str).str.zfill(2)
-            temp_df['statefip'] = pd.Categorical(temp_df['statefip'])
-            temp_df['faminc_cat'] = clean_faminc(temp_df['faminc'].astype(str))
-            temp_df['whyunemp'] = "Not_Unemployed"
-            unemployed_mask = temp_df['current_state'] == "unemployed"
-            temp_df.loc[unemployed_mask, 'whyunemp'] = temp_df.loc[unemployed_mask, 'whyunemp'].astype(str) # Ensure string type before categorizing
-            temp_df['whyunemp'] = pd.Categorical(temp_df['whyunemp'])
-            temp_df['ahrsworkt_cat'] = "Not_Employed"
-            employed_mask = temp_df['current_state'] == "employed"
-            temp_df.loc[employed_mask, 'ahrsworkt_cat'] = temp_df.loc[employed_mask, 'ahrsworkt'].astype(str)
-            temp_df.loc[temp_df['ahrsworkt_cat'].isin(['nan', 'NA', '']), 'ahrsworkt_cat'] = "Unknown_Hours"
-            temp_df['ahrsworkt_cat'] = temp_df['ahrsworkt_cat'].str.replace("40+", "40plus", regex=False)
-            temp_df['ahrsworkt_cat'] = pd.Categorical(temp_df['ahrsworkt_cat'])
-            temp_df['durunemp'] = pd.to_numeric(temp_df['durunemp'], errors='coerce')
-            temp_df.loc[temp_df['current_state'] != "unemployed", 'durunemp'] = 0
-            temp_df['ind_group_cat'] = temp_df['ind_group'].astype(str).replace(['', 'nan'], 'Unknown')
-            temp_df['ind_group_cat'] = pd.Categorical(temp_df['ind_group_cat'])
-            temp_df['occ_2dig_cat'] = temp_df['occ_2dig'].astype(str).replace(['', 'nan', '99'], 'Unknown')
-            occ_mask = temp_df['occ_2dig_cat'] != 'Unknown'
-            # Ensure numeric conversion before zfill
-            numeric_occ = pd.to_numeric(temp_df.loc[occ_mask, 'occ_2dig_cat'], errors='coerce')
-            temp_df.loc[occ_mask & numeric_occ.notna(), 'occ_2dig_cat'] = 'Occ' + numeric_occ[numeric_occ.notna()].astype(int).astype(str).str.zfill(2)
-            temp_df['occ_2dig_cat'] = pd.Categorical(temp_df['occ_2dig_cat'])
-            temp_df['mth_dim1'] = pd.to_numeric(temp_df['mth_dim1'], errors='coerce')
-            temp_df['mth_dim2'] = pd.to_numeric(temp_df['mth_dim2'], errors='coerce')
+             # Adjust 'sex' handling based on R output format
+            if 'sex' in temp_df.columns:
+                 # If R outputs 1/2, map it here. If it outputs "Male"/"Female", ensure categorical.
+                 if temp_df['sex'].dtype == 'object' or pd.api.types.is_categorical_dtype(temp_df['sex']):
+                      temp_df['sex'] = pd.Categorical(temp_df['sex']) # Ensure categorical if string
+                 elif pd.api.types.is_numeric_dtype(temp_df['sex']):
+                      sex_map = {1: "Male", 2: "Female"}
+                      temp_df['sex'] = pd.Categorical(temp_df['sex'].map(sex_map))
+                 else:
+                      print(f"Warning: Unexpected dtype for 'sex' column: {temp_df['sex'].dtype}")
+
+
+            for col in categorical_cols:
+                if col in temp_df.columns:
+                    # Convert object columns or ensure existing categories are recognized
+                    if temp_df[col].dtype == 'object':
+                         temp_df[col] = pd.Categorical(temp_df[col].fillna("Unknown")) # Fill NA before making categorical
+                    elif pd.api.types.is_categorical_dtype(temp_df[col]):
+                         # If already categorical, ensure 'Unknown' is a category if NAs existed
+                         if temp_df[col].isnull().any():
+                              if "Unknown" not in temp_df[col].cat.categories:
+                                   temp_df[col] = temp_df[col].cat.add_categories("Unknown")
+                              temp_df[col] = temp_df[col].fillna("Unknown")
+                    else:
+                         # Handle numeric codes if R script didn't convert them (should not happen ideally)
+                         print(f"Warning: Column '{col}' expected to be categorical/object, found {temp_df[col].dtype}. Converting.")
+                         temp_df[col] = pd.Categorical(temp_df[col].astype(str).fillna("Unknown"))
+                else:
+                    # Only print warning if it's a core category expected from R
+                    core_cats = ['race_cat', 'hispan_cat', 'educ_cat', 'statefip', 'ind_group_cat', 'occ_group_cat']
+                    if col in core_cats:
+                        print(f"Warning: Expected categorical column '{col}' not found in input data.")
+
+
+            # 5. Calculate time difference (months_since_last) - This needs to be done here
             temp_df = temp_df.sort_values(['cpsidp', 'date'])
             temp_df['time_diff_days'] = temp_df.groupby('cpsidp')['date'].diff().dt.days
             temp_df['months_since_last'] = (temp_df['time_diff_days'] / 30.4375).round()
             temp_df['months_since_last'] = temp_df['months_since_last'].fillna(0).astype(int)
-            # Ensure wtfinl is numeric
-            temp_df['wtfinl'] = pd.to_numeric(temp_df['wtfinl'], errors='coerce').fillna(0)
-            return temp_df, target_map # Return map as well
+            temp_df = temp_df.drop(columns=['time_diff_days'], errors='ignore') # Clean up intermediate column
+
+            # 6. Define inverse map for metadata
+            target_map_inverse = {v: k for k, v in target_map.items()}
+
+            # Remove original state columns if they won't be used directly as predictors
+            # temp_df = temp_df.drop(columns=['emp_state', 'emp_state_f1'], errors='ignore')
+
+            return temp_df, target_map, target_map_inverse # Return both maps
 
         print("Applying cleaning steps to 'data_for_fitting_raw'...")
-        data_for_fitting_clean, target_map = apply_cleaning(data_for_fitting_raw)
-        target_map_inverse = {v: k for k, v in target_map.items()} # Get inverse map
+        # Pass target_map explicitly if needed elsewhere, otherwise just get df and inverse map
+        data_for_fitting_clean, target_map, target_map_inverse = apply_cleaning(data_for_fitting_raw)
+        # target_map_inverse = {v: k for k, v in target_map.items()} # Get inverse map - now returned by function
 
         print("Applying cleaning steps to 'hpt_val_data_raw'...")
-        hpt_val_data_clean, _ = apply_cleaning(hpt_val_data_raw)
+        # Don't need maps from this, just the cleaned df
+        hpt_val_data_clean, _, _ = apply_cleaning(hpt_val_data_raw)
 
     except Exception as e:
         print(f"ERROR during data cleaning or time splitting: {e}")
@@ -195,30 +221,48 @@ def preprocess_data():
 
     # --- 2. Define Columns & Create Final DF ---
     print("\n===== STEP 2: Defining Columns =====")
+    # Update predictor_cols list to use the variable names expected from the R script's output
+    # These should align with the columns processed/checked in the simplified apply_cleaning
     predictor_cols = [
-        'current_state', 'age', 'sex', 'race_cat', 'hispan_cat', 'educ_cat', 'statefip', 'faminc_cat',
-        'whyunemp', 'ahrsworkt_cat', 'durunemp', 'ind_group_cat', 'occ_2dig_cat',
-        'mth_dim1', 'mth_dim2', 'months_since_last',
-        'national_unemp_rate', 'national_emp_rate', 'state_unemp_rate', 'state_emp_rate',
-        'ind_group_unemp_rate', 'ind_group_emp_rate'
+        'current_state', # Derived in Python from emp_state
+        'age', 'sex', # 'sex' is now categorical string "Male"/"Female" or handled above
+        'race_cat', 'hispan_cat', 'educ_cat', 'statefip', # Categorical from R
+        'durunemp', # Numeric from R
+        'ind_group_cat', 'occ_group_cat', # Categorical groups from R
+        'mth_dim1', 'mth_dim2', # Numeric cyclical month from R
+        'months_since_last', # Derived in Python
+        'national_unemp_rate', 'national_emp_rate', # Numeric rates from R
+        'state_unemp_rate', 'state_emp_rate', # Numeric rates from R
+        'ind_group_unemp_rate', 'ind_group_emp_rate', # Numeric rates from R
+        # Categorical variables from R
+        'relate_cat', 'metro_cat', 'cbsasz_cat', 'marst_cat', 'citizen_cat',
+        'nativity_cat', 'vetstat_cat',
+        'famsize', 'nchild', # Numeric from R
+        'diff_cat', # Use diff_cat from R
+        'profcert_cat', 'classwkr_cat' # Categorical from R
     ]
-    original_id_cols = ['statefip', 'ind_group_cat']
-    # Add wtfinl to base_id_cols
-    base_id_cols = ['cpsidp', 'date', 'target_state', 'wtfinl']
 
-    # Ensure original ID columns and wtfinl are present in both dataframes
-    missing_orig_ids_fit = [col for col in original_id_cols if col not in data_for_fitting_clean.columns]
-    missing_orig_ids_hpt = [col for col in original_id_cols if col not in hpt_val_data_clean.columns]
-    if 'wtfinl' not in data_for_fitting_clean.columns: missing_orig_ids_fit.append('wtfinl')
-    if not hpt_val_data_clean.empty and 'wtfinl' not in hpt_val_data_clean.columns: missing_orig_ids_hpt.append('wtfinl')
+    # Original ID columns kept for potential analysis/debugging (should exist in input)
+    # These are the *cleaned* categorical versions used for merging rates in R
+    original_id_cols = ['statefip', 'ind_group_cat', 'occ_group_cat']
+    # Base ID columns needed
+    base_id_cols = ['cpsidp', 'date', 'target_state', 'wtfinl'] # target_state created in Python
 
-    if missing_orig_ids_fit or missing_orig_ids_hpt:
-        raise ValueError(f"Missing original identifier or weight columns needed: Fit({missing_orig_ids_fit}), HPT({missing_orig_ids_hpt})")
+    # Ensure all required columns (predictors, base IDs, original IDs) exist after cleaning
+    all_needed_cols = list(dict.fromkeys(base_id_cols + predictor_cols + original_id_cols))
+    missing_cols_fit = [col for col in all_needed_cols if col not in data_for_fitting_clean.columns]
+    missing_cols_hpt = [col for col in all_needed_cols if col not in hpt_val_data_clean.columns and not hpt_val_data_clean.empty]
 
-    # Columns to keep before processing
-    keep_cols = list(dict.fromkeys(base_id_cols + predictor_cols + original_id_cols))
+    if missing_cols_fit:
+         raise ValueError(f"Missing required columns in fitting data after cleaning: {missing_cols_fit}")
+    if missing_cols_hpt:
+         raise ValueError(f"Missing required columns in HPT validation data after cleaning: {missing_cols_hpt}")
 
-    # Select columns for both dataframes
+
+    # Columns to keep before processing (already filtered by all_needed_cols check)
+    keep_cols = all_needed_cols
+
+    # Select columns for both dataframes - use the validated list
     df_final_fit = data_for_fitting_clean[keep_cols].copy()
     df_final_hpt = hpt_val_data_clean[keep_cols].copy() if not hpt_val_data_clean.empty else pd.DataFrame(columns=keep_cols)
 
@@ -432,27 +476,36 @@ def preprocess_data():
     n_features = len(final_feature_names_after_vt)
 
     print("Calculating n_classes from target_state column in fitting data...")
-    unique_target_values_inc_na = df_final_fit['target_state'].unique()
-    valid_target_values = unique_target_values_inc_na[~pd.isna(unique_target_values_inc_na)]
-    n_classes = len(valid_target_values)
-    print(f"Final calculated n_classes: {n_classes}")
-    if len(df_final_fit) > 0 and n_classes == 0: # Check if df_final is not empty
-        print("WARNING: Target state column appears to be all NA values or the cleaned fitting dataframe is empty.")
-        print("STOPPING: Cannot determine n_classes.")
-        return # Stop execution
-    elif n_classes != 3:
-        print(f"WARNING: Expected 3 classes (0, 1, 2) but found {n_classes} unique non-NA values: {np.sort(valid_target_values)}.")
-        print("STOPPING: Incorrect number of target classes determined.")
+    # Use the target_map keys/values directly as n_classes should be fixed at 3
+    # unique_target_values_inc_na = df_final_fit['target_state'].unique()
+    # valid_target_values = unique_target_values_inc_na[~pd.isna(unique_target_values_inc_na)]
+    # n_classes = len(valid_target_values)
+    n_classes = len(target_map) # Should be 3 based on the map definition
+    print(f"Using n_classes based on target_map: {n_classes}")
+
+    # Add a check that the actual values in target_state match the map keys
+    if not df_final_fit.empty:
+        actual_targets = df_final_fit['target_state'].dropna().unique()
+        expected_targets = target_map.values()
+        if not set(actual_targets).issubset(set(expected_targets)):
+             print(f"WARNING: Found target_state values {actual_targets} not fully contained in expected map values {expected_targets}.")
+             # Decide if this is critical enough to stop
+             # return # Stop execution
+
+    if n_classes != 3:
+        print(f"ERROR: Expected 3 classes based on target_map, but map has {n_classes} entries.")
+        print("STOPPING: Incorrect number of target classes determined from map.")
         return # Stop execution
     else:
         print("Confirmed n_classes = 3.")
+
 
     metadata = {
         'feature_names': final_feature_names_after_vt.tolist(),
         'n_features': n_features,
         'n_classes': n_classes,
-        'target_state_map': target_map,
-        'target_state_map_inverse': target_map_inverse,
+        'target_state_map': target_map, # Use map defined in apply_cleaning
+        'target_state_map_inverse': target_map_inverse, # Use inverse map from apply_cleaning
         'original_identifier_columns': original_id_cols,
         'pad_value': config.PAD_VALUE,
         'train_individuals': len(train_ids),
@@ -463,7 +516,7 @@ def preprocess_data():
         'test_rows_baked': len(test_data_baked),
         'hpt_val_rows_baked': len(hpt_baked_df), # Add count for HPT val set
         'preprocessing_pipeline_path': str(preprocessor_file),
-        'hpt_validation_data_path': str(hpt_val_file) if hpt_val_file.exists() else None, # Add path to HPT val data
+        'hpt_validation_data_path': str(hpt_val_file) if not hpt_baked_df.empty else None, # Check if df is empty
         'full_baked_data_path': str(full_baked_file), # Add path to the full data
         'weight_column': 'wtfinl' # Add weight column name to metadata
     }

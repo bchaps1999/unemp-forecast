@@ -379,7 +379,7 @@ def calculate_group_rates(sampled_states_np: np.ndarray, # Shape (n_individuals,
     return rates.to_dict(orient='index')
 
 
-# Modified to use group-specific rates
+# Modified to use group-specific rates and handle ind/occ/class updates
 def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shape: (n_individuals, seq_len, n_features)
                                   sampled_states: torch.Tensor, # Shape: (n_individuals,)
                                   original_identifiers_df: pd.DataFrame,
@@ -394,6 +394,7 @@ def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shap
     Updates sequences for the next step for ONE sample run. Shifts sequence, appends new features based on sampled state.
     Handles basic time updates and updates aggregate rate features using the provided GROUP-SPECIFIC rates
     (defaulting to previous value if group rate is missing) and overall sample rates for national features.
+    Handles industry/occupation/class updates on transition to employment using historical lookback.
     """
     n_individuals, seq_len, n_features = current_sequences_tensor.shape
     pad_val = config.PAD_VALUE
@@ -401,13 +402,24 @@ def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shap
     original_id_cols = metadata.get('original_identifier_columns', [])
     state_col = 'statefip' if 'statefip' in original_id_cols else None
     ind_col = 'ind_group_cat' if 'ind_group_cat' in original_id_cols else None
+    # Add occ_col and class_col if they are part of original_id_cols and needed for lookups (unlikely)
+    # occ_col = 'occ_group_cat' if 'occ_group_cat' in original_id_cols else None
+    # class_col = 'classwkr_cat' if 'classwkr_cat' in original_id_cols else None
 
     # --- Identify key feature indices ---
     try:
         target_map_inverse = metadata['target_state_map_inverse']
+        # Map integer state to lowercase string representation
+        int_to_state_str = {k: v.lower().replace(' ', '_').replace('_in_labor_force', '') for k, v in target_map_inverse.items()}
+        employed_int = next((k for k, v in int_to_state_str.items() if v == 'employed'), 0)
+        unemployed_int = next((k for k, v in int_to_state_str.items() if v == 'unemployed'), 1)
+        nilf_int = next((k for k, v in int_to_state_str.items() if v == 'not'), 2)
+
+        # Indices for one-hot encoded current state
         state_cols = [f for f in feature_names if f.startswith('cat__current_state_')]
         state_indices = {col: feature_names.index(col) for col in state_cols}
-        int_to_state_suffix = {k: v.lower() for k, v in target_map_inverse.items()}
+
+        # Indices for other features to update
         age_idx = feature_names.index('num__age') if 'num__age' in feature_names else -1
         durunemp_idx = feature_names.index('num__durunemp') if 'num__durunemp' in feature_names else -1
         months_last_idx = feature_names.index('num__months_since_last') if 'num__months_since_last' in feature_names else -1
@@ -417,51 +429,89 @@ def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shap
         state_emp_idx = feature_names.index('num__state_emp_rate') if 'num__state_emp_rate' in feature_names else -1
         ind_unemp_idx = feature_names.index('num__ind_group_unemp_rate') if 'num__ind_group_unemp_rate' in feature_names else -1
         ind_emp_idx = feature_names.index('num__ind_group_emp_rate') if 'num__ind_group_emp_rate' in feature_names else -1
-    except (ValueError, KeyError) as e:
+
+        # Indices for one-hot encoded industry, occupation, class worker features
+        ind_group_indices = {f: feature_names.index(f) for f in feature_names if f.startswith('cat__ind_group_cat_')}
+        occ_group_indices = {f: feature_names.index(f) for f in feature_names if f.startswith('cat__occ_group_cat_')}
+        classwkr_indices = {f: feature_names.index(f) for f in feature_names if f.startswith('cat__classwkr_cat_')}
+
+        # Identify the index for the 'Unknown' or 'NIU' category within each group, if it exists
+        # These categories should NOT be carried forward during the lookback
+        unknown_suffixes = ['unknown', 'niu', 'other/niu', 'unemployed/niu', '_other_'] # Possible suffixes/names for unknown/NIU categories
+        def get_unknown_indices(group_indices, suffixes):
+            unknown_idx = set()
+            for name, idx in group_indices.items():
+                for suffix in suffixes:
+                    if name.lower().endswith(suffix):
+                        unknown_idx.add(idx)
+                        break
+            return list(unknown_idx)
+
+        ind_unknown_indices = get_unknown_indices(ind_group_indices, unknown_suffixes)
+        occ_unknown_indices = get_unknown_indices(occ_group_indices, unknown_suffixes)
+        classwkr_unknown_indices = get_unknown_indices(classwkr_indices, unknown_suffixes)
+
+    except (ValueError, KeyError, StopIteration) as e:
         print(f"ERROR: Could not find expected feature indices or state mapping in metadata. Error: {e}")
         raise
 
     # --- Calculate next period's time features ---
+    # (This part remains the same)
     current_year = current_period // 100
     current_month = current_period % 100
     if current_month == 12: next_month = 1
     else: next_month = current_month + 1
 
     # --- Create new feature vectors ---
+    # Initialize by copying the features from the *last* time step of the input sequence
     new_feature_vectors = np.full((n_individuals, n_features), pad_val, dtype=np.float32)
     last_valid_features_np = current_sequences_tensor.cpu().numpy()[:, -1, :]
-    new_feature_vectors[:, :] = last_valid_features_np
+    new_feature_vectors[:, :] = last_valid_features_np # Start with previous step's features
     sampled_states_np = sampled_states.cpu().numpy()
+    sequence_history_np = current_sequences_tensor.cpu().numpy() # Get full history for lookback
 
     # --- Update features ---
     for i in range(n_individuals):
         sampled_state_int = sampled_states_np[i]
         ind_identifiers = original_identifiers_df.iloc[i]
-        previous_features = last_valid_features_np[i] # Get the feature vector from the previous step
+        previous_features = last_valid_features_np[i] # Features from the step *before* prediction
 
-        # 1. Update 'current_state'
-        for col_name, idx in state_indices.items(): new_feature_vectors[i, idx] = 0.0
+        # Determine previous state from the one-hot encoding in previous_features
+        previous_state_int = -1
+        for state_col_name, state_idx in state_indices.items():
+            if previous_features[state_idx] > 0.5: # Check if this state was active
+                try:
+                    # Extract state integer from column name like 'cat__current_state_employed' -> employed_int
+                    state_str = state_col_name.split('cat__current_state_')[-1]
+                    previous_state_int = next(k for k, v in int_to_state_str.items() if v == state_str)
+                    break
+                except (StopIteration, IndexError): continue # Should not happen if names are consistent
+
+        # 1. Update 'current_state' based on sampled_state_int
+        for col_name, idx in state_indices.items(): new_feature_vectors[i, idx] = 0.0 # Reset all state flags
         try:
-            state_suffix = int_to_state_suffix[sampled_state_int]
+            state_suffix = int_to_state_str[sampled_state_int]
             target_col_name = f'cat__current_state_{state_suffix}'
             target_idx = state_indices[target_col_name]
             new_feature_vectors[i, target_idx] = 1.0
-        except KeyError: pass # Warning printed before
+        except KeyError:
+             print(f"Warning: Sampled state {sampled_state_int} not found in int_to_state_str map.")
 
-        # 2. Update Time Features
-        if age_idx != -1 and next_month == 1: new_feature_vectors[i, age_idx] += 1
-        if months_last_idx != -1: new_feature_vectors[i, months_last_idx] += 1
+        # 2. Update Time Features (Age, Months Since Last, Duration Unemployed)
+        if age_idx != -1 and next_month == 1: new_feature_vectors[i, age_idx] += 1 # Increment age in January
+        if months_last_idx != -1: new_feature_vectors[i, months_last_idx] += 1 # Increment months since last observation
         if durunemp_idx != -1:
-            is_unemployed = (target_map_inverse.get(sampled_state_int, '').lower() == 'unemployed')
-            new_feature_vectors[i, durunemp_idx] = new_feature_vectors[i, durunemp_idx] + 1 if is_unemployed else 0
+            is_unemployed_now = (sampled_state_int == unemployed_int)
+            # Increment duration if unemployed, reset if not. Use previous duration value.
+            new_feature_vectors[i, durunemp_idx] = previous_features[durunemp_idx] + 1 if is_unemployed_now else 0
 
-        # 3. Update Aggregate Rate Features
+        # 3. Update Aggregate Rate Features (National, State, Industry)
+        # (This part remains the same - uses group rates calculated outside)
         current_state_id = ind_identifiers.get(state_col, None) if state_col else None
         current_ind_id = ind_identifiers.get(ind_col, None) if ind_col else None
-        ind_state_rates = state_rates.get(current_state_id, None) if current_state_id else None # Get dict or None
-        ind_industry_rates = industry_rates.get(current_ind_id, None) if current_ind_id else None # Get dict or None
+        ind_state_rates = state_rates.get(current_state_id, None) if current_state_id else None
+        ind_industry_rates = industry_rates.get(current_ind_id, None) if current_ind_id else None
 
-        # Use group-specific rates for state/industry features, default to PREVIOUS value if rate missing
         if state_unemp_idx != -1:
             new_rate = ind_state_rates.get('unemp_rate') if ind_state_rates else None
             new_feature_vectors[i, state_unemp_idx] = new_rate if new_rate is not None else previous_features[state_unemp_idx]
@@ -475,13 +525,54 @@ def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shap
             new_rate = ind_industry_rates.get('emp_rate') if ind_industry_rates else None
             new_feature_vectors[i, ind_emp_idx] = new_rate if new_rate is not None else previous_features[ind_emp_idx]
 
-        # Use overall sample rates for national features
         if nat_unemp_idx != -1: new_feature_vectors[i, nat_unemp_idx] = overall_sample_unemp_rate
         if nat_emp_idx != -1: new_feature_vectors[i, nat_emp_idx] = overall_sample_emp_rate
 
+        # 4. Update Industry/Occupation/Class Worker Features on Transition to Employment
+        transition_to_emp = (previous_state_int in [unemployed_int, nilf_int]) and (sampled_state_int == employed_int)
+
+        if transition_to_emp:
+            # Helper function for lookback
+            def find_last_valid_category_index(history, group_indices, unknown_indices):
+                last_valid_idx = -1
+                # Look backwards from the second-to-last time step (t = seq_len - 2)
+                for t in range(seq_len - 2, -1, -1):
+                    step_features = history[t, :]
+                    # Check if any category in this group was active (value > 0.5)
+                    active_indices = [idx for idx in group_indices.values() if step_features[idx] > 0.5]
+                    if active_indices:
+                        # Found an active category, check if it's NOT an unknown/NIU one
+                        found_idx = active_indices[0] # Assume only one is active due to one-hot
+                        if found_idx not in unknown_indices:
+                            last_valid_idx = found_idx
+                            break # Stop lookback once a valid category is found
+                return last_valid_idx
+
+            # Perform lookback for each group
+            last_ind_idx = find_last_valid_category_index(sequence_history_np[i], ind_group_indices, ind_unknown_indices)
+            last_occ_idx = find_last_valid_category_index(sequence_history_np[i], occ_group_indices, occ_unknown_indices)
+            last_cls_idx = find_last_valid_category_index(sequence_history_np[i], classwkr_indices, classwkr_unknown_indices)
+
+            # Update new feature vector if a valid historical category was found
+            if last_ind_idx != -1:
+                for idx in ind_group_indices.values(): new_feature_vectors[i, idx] = 0.0 # Reset group
+                new_feature_vectors[i, last_ind_idx] = 1.0 # Set historical category
+            # Else: Keep the features inherited from the previous step (likely 'Unknown'/'NIU')
+
+            if last_occ_idx != -1:
+                for idx in occ_group_indices.values(): new_feature_vectors[i, idx] = 0.0
+                new_feature_vectors[i, last_occ_idx] = 1.0
+
+            if last_cls_idx != -1:
+                for idx in classwkr_indices.values(): new_feature_vectors[i, idx] = 0.0
+                new_feature_vectors[i, last_cls_idx] = 1.0
+
     # --- Shift sequences and append ---
+    # Shift left (remove oldest time step) from the original tensor
     shifted_sequences = current_sequences_tensor[:, 1:, :].cpu().numpy()
+    # Append the newly calculated feature vectors as the last time step
     new_sequences_np = np.concatenate([shifted_sequences, new_feature_vectors[:, np.newaxis, :]], axis=1)
+    # Convert back to tensor and return on the original device
     return torch.from_numpy(new_sequences_np).to(current_sequences_tensor.device)
 
 

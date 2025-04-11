@@ -516,6 +516,9 @@ def load_and_prepare_data(train_file, val_file, metadata_file, date_col, group_i
             train_start_dt = pd.to_datetime(train_start_date)
             train_data_baked = train_data_baked[train_data_baked[date_col] >= train_start_dt].copy()
             val_data_baked = val_data_baked[val_data_baked[date_col] >= train_start_dt].copy()
+            # Apply start date to HPT val data as well (though less common use case)
+            if hpt_val_data_baked is not None:
+                hpt_val_data_baked = hpt_val_data_baked[hpt_val_data_baked[date_col] >= train_start_dt].copy()
             print(f"Applied TRAIN_START_DATE >= {train_start_date}")
         except Exception as e:
             print(f"Warning: Could not apply train_start_date filter: {e}")
@@ -525,6 +528,9 @@ def load_and_prepare_data(train_file, val_file, metadata_file, date_col, group_i
             train_end_dt = pd.to_datetime(train_end_date)
             train_data_baked = train_data_baked[train_data_baked[date_col] <= train_end_dt].copy()
             val_data_baked = val_data_baked[val_data_baked[date_col] <= train_end_dt].copy()
+            # Apply end date filter to HPT validation data
+            if hpt_val_data_baked is not None:
+                hpt_val_data_baked = hpt_val_data_baked[hpt_val_data_baked[date_col] <= train_end_dt].copy()
             print(f"Applied TRAIN_END_DATE <= {train_end_date}")
         except Exception as e:
             print(f"Warning: Could not apply train_end_date filter: {e}")
@@ -532,9 +538,11 @@ def load_and_prepare_data(train_file, val_file, metadata_file, date_col, group_i
     print(f"Train data rows: {initial_train_rows} -> {len(train_data_baked)}")
     print(f"Validation data rows: {initial_val_rows} -> {len(val_data_baked)}")
     if hpt_val_data_baked is not None:
-        print(f"HPT Validation data rows: {initial_hpt_val_rows} -> {len(hpt_val_data_baked)}")
+        print(f"HPT Validation data rows: {initial_hpt_val_rows} -> {len(hpt_val_data_baked)}") # Show filtered count
     if len(train_data_baked) == 0 or len(val_data_baked) == 0:
-         raise ValueError("No data remaining after date filtering.")
+         raise ValueError("No data remaining after date filtering for train/val splits.")
+    if hpt_val_data_baked is not None and len(hpt_val_data_baked) == 0:
+         print("Warning: No data remaining in HPT validation set after date filtering.")
 
     return train_data_baked, val_data_baked, hpt_val_data_baked, metadata, feature_names, n_features, n_classes
 
@@ -817,19 +825,26 @@ def run_training_loop(model, train_loader, val_loader, criterion, optimizer, sch
 
 
 # --- Updated Function for HPT Metric Calculation ---
-def calculate_hpt_metric(model, x_hpt_val_np, y_hpt_val_np, date_hpt_val_np, weight_hpt_val_np, hparams, device, metadata, parallel_workers):
+def calculate_hpt_weighted_log_loss(model, x_hpt_val_np, y_hpt_val_np, date_hpt_val_np, weight_hpt_val_np, hparams, device, parallel_workers):
     """
-    Calculates the RMSE of monthly weighted aggregate unemployment errors on the HPT validation set.
+    Calculates the HPT objective: the average of monthly average weighted cross-entropy losses
+    on the HPT validation set.
     """
-    print("\n===== Calculating HPT Metric (RMSE of Monthly Weighted Agg Errors on HPT Val Set) =====")
+    print("\n===== Calculating HPT Metric (Avg Monthly Weighted Log Loss on HPT Val Set) =====")
     if x_hpt_val_np is None or x_hpt_val_np.shape[0] == 0:
         print("HPT validation sequence data is empty. Cannot calculate HPT metric.")
         return float('inf') # Return infinity if no data
+    # Ensure date array is passed and available
+    if date_hpt_val_np is None or date_hpt_val_np.shape[0] != x_hpt_val_np.shape[0]:
+         print("ERROR: HPT validation date array is missing or has incorrect shape.")
+         return float('inf')
 
     pad_value = hparams['pad_value']
     batch_size = hparams['batch_size']
 
-    monthly_mses = []
+    model.eval() # Ensure model is in evaluation mode
+    monthly_avg_losses = []
+
     try:
         # Convert numpy datetime64 array to pandas DatetimeIndex for easier manipulation
         target_dates_pd = pd.to_datetime(date_hpt_val_np)
@@ -842,7 +857,10 @@ def calculate_hpt_metric(model, x_hpt_val_np, y_hpt_val_np, date_hpt_val_np, wei
         pin_memory = device.type == 'cuda'
         persistent_workers = dataloader_workers > 0 and pin_memory
 
-        for month in tqdm(unique_months, desc="Evaluating HPT Months"):
+        # Use CrossEntropyLoss with reduction='none' to get per-sample loss
+        criterion = nn.CrossEntropyLoss(reduction='none').to(device)
+
+        for month in tqdm(unique_months, desc="Evaluating HPT Months (Log Loss)"):
             # Create a boolean mask for the current month
             month_start = month.start_time
             month_end = month.end_time
@@ -857,11 +875,10 @@ def calculate_hpt_metric(model, x_hpt_val_np, y_hpt_val_np, date_hpt_val_np, wei
                 print(f"  Skipping month {month}: No sequences found.")
                 continue
 
-            print(f"  Processing month {month}: {x_month.shape[0]} sequences.")
+            # print(f"  Processing month {month}: {x_month.shape[0]} sequences.")
 
             # Create Dataset and DataLoader for the current month
             try:
-                # Pass weights to SequenceDataset
                 month_dataset = SequenceDataset(x_month, y_month, w_month, pad_value)
                 month_loader = DataLoader(
                     month_dataset,
@@ -869,35 +886,46 @@ def calculate_hpt_metric(model, x_hpt_val_np, y_hpt_val_np, date_hpt_val_np, wei
                     shuffle=False,
                     num_workers=dataloader_workers,
                     pin_memory=pin_memory,
-                    persistent_workers=persistent_workers, # May not be beneficial for small monthly loaders
+                    persistent_workers=False, # Often not beneficial for small monthly loaders
                     worker_init_fn=worker_init_fn if dataloader_workers > 0 else None
                 )
             except Exception as e:
                 print(f"  ERROR creating DataLoader for month {month}: {e}")
                 continue # Skip month if dataloader fails
 
-            # Evaluate Weighted Aggregate Error for the month
-            monthly_agg_error = evaluate_aggregate_unemployment_error(model, month_loader, device, metadata)
-            if np.isnan(monthly_agg_error) or np.isinf(monthly_agg_error):
-                 print(f"  Warning: Invalid aggregate error ({monthly_agg_error}) for month {month}. Skipping.")
+            # Calculate weighted log loss for the month
+            total_weighted_loss_month = 0.0
+            total_weight_month = 0.0
+            with torch.no_grad():
+                for x_batch, y_batch, w_batch, mask_batch in month_loader:
+                    x_batch, y_batch, w_batch, mask_batch = x_batch.to(device), y_batch.to(device), w_batch.to(device), mask_batch.to(device)
+                    outputs = model(x_batch, src_key_padding_mask=mask_batch)
+                    per_sample_loss = criterion(outputs, y_batch)
+                    weighted_loss_batch = per_sample_loss * w_batch
+                    total_weighted_loss_month += weighted_loss_batch.sum().item()
+                    total_weight_month += w_batch.sum().item()
+
+            if total_weight_month > 0:
+                monthly_avg_loss = total_weighted_loss_month / total_weight_month
+                # print(f"  Avg Weighted Log Loss for month {month}: {monthly_avg_loss:.6f}")
+                monthly_avg_losses.append(monthly_avg_loss)
             else:
-                 print(f"  Weighted Aggregate MSE for month {month}: {monthly_agg_error:.6f}")
-                 monthly_mses.append(monthly_agg_error)
+                print(f"  Warning: Zero total weight for month {month}. Skipping month's loss.")
 
     except Exception as e:
-        print(f"ERROR during monthly HPT evaluation: {e}")
+        print(f"ERROR during monthly HPT weighted log loss calculation: {e}")
         traceback.print_exc()
         return float('inf') # Return infinity on error
 
-    # Calculate RMSE across valid monthly MSEs
-    if not monthly_mses:
-        print("No valid monthly MSEs were calculated. Cannot compute RMSE.")
+    # Calculate the final average across valid monthly losses
+    if not monthly_avg_losses:
+        print("No valid monthly weighted log losses were calculated. Cannot compute final HPT metric.")
         return float('inf')
 
-    rmse = np.sqrt(np.mean(monthly_mses))
-    print(f"\nCalculated RMSE across {len(monthly_mses)} months: {rmse:.6f}")
+    final_average_loss = np.mean(monthly_avg_losses)
+    print(f"\nCalculated Final HPT Metric (Average of Monthly Avg Weighted Log Losses): {final_average_loss:.6f}")
 
-    return rmse
+    return final_average_loss
 
 
 # --- Main Train/Evaluate Function ---
@@ -905,17 +933,17 @@ def calculate_hpt_metric(model, x_hpt_val_np, y_hpt_val_np, date_hpt_val_np, wei
 def train_and_evaluate(hparams: dict, trial: optuna.Trial = None):
     """
     Main function to load data, build model, train, and evaluate based on hyperparameters.
-    Handles graceful exit and Optuna integration. Calculates HPT metric (RMSE of monthly weighted MSEs) if applicable.
+    Handles graceful exit and Optuna integration. Calculates HPT metric (average of monthly avg weighted log loss) if applicable.
     Args:
         hparams (dict): Dictionary containing all hyperparameters.
         trial (optuna.Trial, optional): Optuna trial object for reporting intermediate values and pruning.
     Returns:
         dict: Dictionary containing evaluation results:
-              {'agg_error': float, 'hpt_agg_error_rmse': float, 'best_val_loss': float,
+              {'agg_error': float, 'hpt_weighted_log_loss': float, 'best_val_loss': float,
                'final_val_acc': float, 'best_epoch': int, 'status': str}
               Returns status='Failed' or 'Interrupted' or 'Pruned' on issues.
               'agg_error' is based on the standard validation set.
-              'hpt_agg_error_rmse' is the RMSE of monthly MSEs on the HPT validation set (inf if not calculated).
+              'hpt_weighted_log_loss' is the average of monthly average weighted log losses on the HPT validation set (inf if not calculated).
     """
     global stop_training_flag
     stop_training_flag = False # Reset flag at the start of each run/trial
@@ -926,16 +954,17 @@ def train_and_evaluate(hparams: dict, trial: optuna.Trial = None):
 
     start_run_time = time.time()
     final_agg_error = float('inf') # Error on standard validation set
-    hpt_agg_error_rmse_final = float('inf') # RMSE of monthly errors on HPT validation set
+    hpt_weighted_log_loss_final = float('inf') # HPT metric (Avg of monthly avg weighted log loss)
     best_val_loss_final = float('inf')
     final_val_acc_final = float('nan')
     best_epoch_final = -1
     run_status = "Started"
     model = None # Initialize model to None
-    # Store loaded sequence data for HPT val (including weights)
+    # Store loaded sequence data for HPT val (including weights and dates)
     x_hpt_val_np_loaded, y_hpt_val_np_loaded, date_hpt_val_np_loaded, weight_hpt_val_np_loaded = None, None, None, None
 
     try:
+        # ... (print run type, setup dirs, set seeds) ...
         print("=" * 60)
         run_type = f"Optuna Trial {trial.number}" if trial else "Standard Run"
         print(f"Starting Transformer Model: {run_type}")
@@ -1010,7 +1039,7 @@ def train_and_evaluate(hparams: dict, trial: optuna.Trial = None):
             print(f"Warning: Could not save model parameters: {e}")
 
         # --- Step 5: Setup Training Components ---
-        criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+        criterion = nn.CrossEntropyLoss(weight=class_weights_tensor) # Standard criterion for training loop
         optimizer = optim.Adam(model.parameters(), lr=hparams['learning_rate'])
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 'min', factor=hparams['lr_scheduler_factor'],
@@ -1036,7 +1065,7 @@ def train_and_evaluate(hparams: dict, trial: optuna.Trial = None):
         print("Resetting stop flag before final evaluation.")
         stop_training_flag = False
 
-        # --- Step 7: Final Evaluation (on Standard Validation Set) ---
+        # --- Step 7: Final Evaluation (on Standard Validation Set - Aggregate Error) ---
         print("\n===== STEP 5: Evaluating Model (Weighted Aggregate Error on Standard Val Set) =====")
 
         # Load best weights (based on standard val loss) if checkpoint exists
@@ -1069,16 +1098,16 @@ def train_and_evaluate(hparams: dict, trial: optuna.Trial = None):
             final_agg_error = float('inf') # Mark as infinite if not evaluated
             print("Final Weighted Aggregate Unemployment Rate Error (MSE) on Standard Validation Set: Not Calculated")
 
-        # --- Step 8: HPT Metric Calculation (if Optuna trial) ---
+        # --- Step 8: HPT Metric Calculation (if Optuna trial - Avg Monthly Weighted Log Loss) ---
         if trial:
             # Use the loaded best model (or last model if no checkpoint)
             # Pass the loaded HPT sequence data, dates, and weights
-            hpt_agg_error_rmse_final = calculate_hpt_metric(
+            hpt_weighted_log_loss_final = calculate_hpt_weighted_log_loss(
                 model, x_hpt_val_np_loaded, y_hpt_val_np_loaded, date_hpt_val_np_loaded, weight_hpt_val_np_loaded,
-                hparams, DEVICE, metadata, parallel_workers
+                hparams, DEVICE, parallel_workers
             )
 
-        # Extract final metrics from history
+        # ... (rest of the function is the same: extract final metrics, determine status) ...
         try:
             final_val_acc_final = next((h for h in reversed(history.get('val_accuracy', [])) if h is not None and not np.isnan(h)), float('nan'))
         except: final_val_acc_final = float('nan')
@@ -1092,9 +1121,9 @@ def train_and_evaluate(hparams: dict, trial: optuna.Trial = None):
 
         # Determine final status
         run_successful = False
-        if trial: # HPT run
-             run_successful = not np.isinf(hpt_agg_error_rmse_final) and not np.isnan(hpt_agg_error_rmse_final)
-        else: # Standard run
+        if trial: # HPT run - success based on new metric
+             run_successful = not np.isinf(hpt_weighted_log_loss_final) and not np.isnan(hpt_weighted_log_loss_final)
+        else: # Standard run - success based on aggregate error
              run_successful = not np.isinf(final_agg_error) and not np.isnan(final_agg_error)
 
         if training_was_interrupted:
@@ -1104,31 +1133,33 @@ def train_and_evaluate(hparams: dict, trial: optuna.Trial = None):
         else:
             run_status = "Finished with Error"
 
+    # ... (exception handling is the same) ...
     except optuna.TrialPruned as e:
         print(f"Optuna Trial Pruned: {e}")
         run_status = "Pruned"
         training_was_interrupted = True
         final_agg_error = float('inf')
-        hpt_agg_error_rmse_final = float('inf')
+        hpt_weighted_log_loss_final = float('inf') # Set HPT metric to inf
     except KeyboardInterrupt:
         print("\nRun interrupted by user (KeyboardInterrupt caught in train_and_evaluate).")
         run_status = "Interrupted"
         training_was_interrupted = True
         final_agg_error = float('inf')
-        hpt_agg_error_rmse_final = float('inf')
+        hpt_weighted_log_loss_final = float('inf') # Set HPT metric to inf
     except (FileNotFoundError, ValueError, RuntimeError, TypeError) as e: # Catch specific expected errors
         print(f"\nA known error occurred during the run: {type(e).__name__}: {e}")
         traceback.print_exc()
         run_status = "Failed"
         final_agg_error = float('inf')
-        hpt_agg_error_rmse_final = float('inf')
+        hpt_weighted_log_loss_final = float('inf') # Set HPT metric to inf
     except Exception as e: # Catch any other unexpected errors
         print(f"\nAn unexpected error occurred during the run: {type(e).__name__}: {e}")
         traceback.print_exc()
         run_status = "Failed"
         final_agg_error = float('inf')
-        hpt_agg_error_rmse_final = float('inf')
+        hpt_weighted_log_loss_final = float('inf') # Set HPT metric to inf
 
+    # ... (finally block is the same, prints updated metric name) ...
     finally:
         # --- Cleanup ---
         signal.signal(signal.SIGINT, original_sigint_handler) # Restore original handler at the very end
@@ -1147,13 +1178,14 @@ def train_and_evaluate(hparams: dict, trial: optuna.Trial = None):
         elapsed_mins = (end_run_time - start_run_time) / 60
         print("-" * 60)
         print(f"Run Status: {run_status} | Elapsed: {elapsed_mins:.2f} minutes")
-        print(f"Final Weighted Agg Error (Standard Val): {final_agg_error}") # Updated metric name
-        print(f"Final Weighted Agg Error RMSE (HPT Val): {hpt_agg_error_rmse_final}") # Updated metric name
+        print(f"Final Weighted Agg Error (Standard Val): {final_agg_error}")
+        print(f"Final Avg Monthly Weighted Log Loss (HPT Val): {hpt_weighted_log_loss_final}") # Updated metric name
         print("=" * 60)
 
+    # ... (return dictionary is the same, key name matches updated metric) ...
     results = {
-        'agg_error': final_agg_error, # Weighted Error on standard val set
-        'hpt_agg_error_rmse': hpt_agg_error_rmse_final, # RMSE of monthly weighted errors on HPT val set
+        'agg_error': final_agg_error, # Weighted Agg Error on standard val set
+        'hpt_weighted_log_loss': hpt_weighted_log_loss_final, # Avg of Monthly Avg Weighted Log Loss on HPT val set
         'best_val_loss': best_val_loss_final, # Best loss on standard val set
         'final_val_acc': final_val_acc_final, # Accuracy corresponding to last epoch on standard val set
         'best_epoch': best_epoch_final, # Epoch number of best_val_loss
@@ -1165,14 +1197,14 @@ def train_and_evaluate(hparams: dict, trial: optuna.Trial = None):
 # --- Optuna Objective Function ---
 
 def objective(trial: optuna.Trial):
-    """Optuna objective function to minimize the RMSE of monthly weighted aggregate unemployment errors on the HPT validation set."""
+    """Optuna objective function to minimize the average weighted log loss on the HPT validation set."""
     study_dir = Path(config.TRAIN_OUTPUT_SUBDIR) / trial.study.study_name
     hpt_results_file = study_dir / HPT_RESULTS_CSV
     best_hparams_file = study_dir / BEST_HPARAMS_PKL
 
     # --- Define Hyperparameter Search Space ---
     hparams = {
-        # 'sequence_length': trial.suggest_int("sequence_length", config.HPT_SEQ_LEN_MIN, config.HPT_SEQ_LEN_MAX), # Removed from HPT
+        # ... (hyperparameter suggestions remain the same) ...
         'embed_dim': trial.suggest_categorical("embed_dim", config.HPT_EMBED_DIM_OPTIONS),
         'num_heads': trial.suggest_categorical("num_heads", config.HPT_NUM_HEADS_OPTIONS),
         'ff_dim': trial.suggest_int("ff_dim", config.HPT_FF_DIM_MIN, config.HPT_FF_DIM_MAX, step=config.HPT_FF_DIM_STEP),
@@ -1199,30 +1231,42 @@ def objective(trial: optuna.Trial):
         'random_seed': config.RANDOM_SEED,
     }
 
-    # --- Constraint Check ---
+    # --- Constraint Check: Prevent using both weighted loss and sampling ---
+    if hparams['use_weighted_loss'] and hparams['use_weighted_sampling']:
+        # If both are suggested as True, force one to be False.
+        # For example, prioritize weighted loss over weighted sampling:
+        print(f"Trial {trial.number}: Both weighted loss and sampling suggested. Disabling weighted sampling.")
+        hparams['use_weighted_sampling'] = False
+        # Alternatively, you could prune the trial immediately:
+        # raise optuna.TrialPruned("Cannot use both weighted loss and weighted sampling simultaneously.")
+
+    # --- Constraint Check: Embed dim vs Num heads ---
     if hparams['embed_dim'] % hparams['num_heads'] != 0:
         print(f"Pruning trial {trial.number}: embed_dim {hparams['embed_dim']} not divisible by num_heads {hparams['num_heads']}")
         raise optuna.TrialPruned(f"embed_dim ({hparams['embed_dim']}) must be divisible by num_heads ({hparams['num_heads']}).")
 
     # --- Run Training and Evaluation ---
     results = train_and_evaluate(hparams, trial)
-    # The objective is now the RMSE of monthly weighted aggregate errors on the HPT validation set
-    hpt_aggregate_error_rmse = results['hpt_agg_error_rmse']
+    # The objective is now the average weighted log loss on the HPT validation set
+    hpt_weighted_log_loss = results['hpt_weighted_log_loss']
 
+    # ... (logging and best param saving remain the same) ...
     # --- Log results to CSV ---
     params_flat = hparams.copy()
     params_flat['mlp_units'] = str(params_flat['mlp_units']) # Flatten list for CSV
-    # Update fieldnames and log_entry for the new metric - remove sequence_length from tunable params list
+    # Update fieldnames and log_entry for the new metric
     tunable_keys = [k for k in params_flat.keys() if k not in [
         'epochs', 'early_stopping_patience', 'lr_scheduler_factor', 'lr_scheduler_patience',
         'max_grad_norm', 'pad_value', 'parallel_workers', 'refresh_sequences',
         'train_start_date', 'train_end_date', 'random_seed', 'n_features', 'n_classes',
         'sequence_length' # Explicitly remove fixed sequence_length
         ]]
-    fieldnames = ['trial_number', 'status', 'hpt_agg_error_rmse', 'agg_error', 'best_val_loss', 'final_val_acc', 'best_epoch'] + tunable_keys
+    # Change hpt_agg_error_rmse to hpt_weighted_log_loss in fieldnames
+    fieldnames = ['trial_number', 'status', 'hpt_weighted_log_loss', 'agg_error', 'best_val_loss', 'final_val_acc', 'best_epoch'] + tunable_keys
     log_entry = {
         'trial_number': trial.number, 'status': results['status'],
-        'hpt_agg_error_rmse': f"{hpt_aggregate_error_rmse:.6f}" if not np.isinf(hpt_aggregate_error_rmse) and not np.isnan(hpt_aggregate_error_rmse) else 'inf',
+        # Log the new metric
+        'hpt_weighted_log_loss': f"{hpt_weighted_log_loss:.6f}" if not np.isinf(hpt_weighted_log_loss) and not np.isnan(hpt_weighted_log_loss) else 'inf',
         'agg_error': f"{results['agg_error']:.6f}" if not np.isinf(results['agg_error']) and not np.isnan(results['agg_error']) else 'inf',
         'best_val_loss': f"{results['best_val_loss']:.6f}" if not np.isinf(results['best_val_loss']) and not np.isnan(results['best_val_loss']) else 'inf',
         'final_val_acc': f"{results['final_val_acc']:.4f}" if not np.isnan(results['final_val_acc']) else 'nan',
@@ -1242,27 +1286,30 @@ def objective(trial: optuna.Trial):
     except Exception as e: print(f"ERROR logging trial {trial.number} results to CSV: {e}")
 
     # --- Update best hyperparameters file ---
-    # ... (logic remains the same, saves trial.params which no longer includes sequence_length) ...
     current_best_value = float('inf')
     try: # Handle case where study has no completed trials yet or best trial failed/pruned
         if trial.study.best_trial and trial.study.best_trial.state == optuna.trial.TrialState.COMPLETE:
              current_best_value = trial.study.best_value
     except ValueError: pass # Keep current_best_value as inf if no completed trials
 
-    # Check if current trial completed successfully and improved the metric
-    if results['status'] == "Completed" and not np.isinf(hpt_aggregate_error_rmse) and not np.isnan(hpt_aggregate_error_rmse) and hpt_aggregate_error_rmse < current_best_value:
-         print(f"Trial {trial.number} improved HPT aggregate error RMSE to {hpt_aggregate_error_rmse:.6f}. Updating best hyperparameters.")
+    # Check if current trial completed successfully and improved the metric (lower is better)
+    if results['status'] == "Completed" and not np.isinf(hpt_weighted_log_loss) and not np.isnan(hpt_weighted_log_loss) and hpt_weighted_log_loss < current_best_value:
+         print(f"Trial {trial.number} improved HPT weighted log loss to {hpt_weighted_log_loss:.6f}. Updating best hyperparameters.")
          try:
-             best_params_to_save = trial.params # trial.params only contains suggested parameters
+             # Save the parameters suggested by Optuna for this trial
+             # Note: If we modified hparams (e.g., forced use_weighted_sampling=False),
+             # trial.params still holds the originally suggested values.
+             # Saving trial.params is standard practice.
+             best_params_to_save = trial.params
              with open(best_hparams_file, 'wb') as f: pickle.dump(best_params_to_save, f)
              print(f"Best hyperparameters updated in {best_hparams_file}")
          except Exception as e: print(f"ERROR saving best hyperparameters for trial {trial.number}: {e}")
 
 
-    # Return the HPT aggregate error RMSE for Optuna to minimize
-    return hpt_aggregate_error_rmse
+    # Return the HPT weighted log loss for Optuna to minimize
+    return hpt_weighted_log_loss
 
-# --- HPT and Standard Run Functions ---
+# ... (rest of the file remains the same) ...
 
 def run_hyperparameter_tuning(args, base_output_dir):
     # ... (setup remains the same) ...
@@ -1280,6 +1327,7 @@ def run_hyperparameter_tuning(args, base_output_dir):
     print(f"HPT results log: {hpt_results_file}")
     print(f"Best hyperparameters file: {best_hparams_file}")
     print(f"Fixed Sequence Length: {config.SEQUENCE_LENGTH}") # Indicate fixed length
+    print(f"HPT Objective: Minimize Average Weighted Log Loss on HPT Validation Set") # State objective
 
 
     # --- Create Study ---
@@ -1293,7 +1341,7 @@ def run_hyperparameter_tuning(args, base_output_dir):
 
     study = optuna.create_study(
         study_name=study_name, storage=storage_name, load_if_exists=True,
-        direction="minimize", # Minimize the HPT aggregate error RMSE
+        direction="minimize", # Minimize the HPT weighted log loss
         pruner=pruner
     )
 
@@ -1324,7 +1372,7 @@ def run_hyperparameter_tuning(args, base_output_dir):
 
 
     # --- Print HPT Summary ---
-    # ... (summary printing remains largely the same, best_trial.params won't include sequence_length) ...
+    # ... (summary printing remains largely the same, update metric name) ...
     print("\n--- HPT Finished ---")
     try:
         print(f"Study statistics: ")
@@ -1348,7 +1396,7 @@ def run_hyperparameter_tuning(args, base_output_dir):
             if best_trial.value is not None:
                  print(f"\nBest trial overall (among completed):")
                  print(f"  Trial Number: {best_trial.number}")
-                 print(f"  Value (Min HPT Agg Error RMSE): {best_trial.value:.6f}") # Updated metric name
+                 print(f"  Value (Min HPT Weighted Log Loss): {best_trial.value:.6f}") # Updated metric name
                  print(f"  Fixed Sequence Length: {config.SEQUENCE_LENGTH}") # Remind user it was fixed
                  print("  Best Tuned Params: ")
                  for key, value in best_trial.params.items(): print(f"    {key}: {value}")
@@ -1362,6 +1410,7 @@ def run_hyperparameter_tuning(args, base_output_dir):
         else: print(f"Best hyperparameters file not created (no successful trials or error saving).")
     except Exception as e: print(f"Error retrieving final study results: {e}")
 
+# ... (run_standard_training and main execution block remain the same) ...
 
 def run_standard_training(base_output_dir):
     """Runs a standard training process, potentially using best HPT params."""
@@ -1460,7 +1509,7 @@ if __name__ == "__main__":
     parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning using Optuna')
     parser.add_argument('--n_trials', type=int, default=config.HPT_N_TRIALS, help='Number of trials for Optuna tuning')
     parser.add_argument('--study_name', type=str, default=config.HPT_STUDY_NAME, help='Name for the Optuna study')
-    
+
     # Fix: Parse the arguments from command line
     args = parser.parse_args()  # This line was incorrect before
 
@@ -1474,6 +1523,6 @@ if __name__ == "__main__":
     if args.tune:
         run_hyperparameter_tuning(args, base_output_dir)
     else:
-        run_standard_training(base_output_dir)
+        run_standard_training(base_output_dir) # Ensure this function is defined above
 
     print("\n--- Python Script Finished ---")
