@@ -51,6 +51,8 @@ def preprocess_data():
     train_file = output_dir_path / config.TRAIN_DATA_FILENAME
     val_file = output_dir_path / config.VAL_DATA_FILENAME
     test_file = output_dir_path / config.TEST_DATA_FILENAME
+    # Output file for HPT validation data
+    hpt_val_file = output_dir_path / config.HPT_VAL_DATA_FILENAME # New path for HPT val data
     # Output file for ALL processed data (potentially used by forecasting)
     full_baked_file = output_dir_path / config.FULL_DATA_FILENAME # New path
     # Other outputs
@@ -79,96 +81,116 @@ def preprocess_data():
         df['cpsidp'] = df['cpsidp'].astype(str)
         df['date'] = pd.to_datetime(df['date'])
 
+        # Apply overall start/end date filters first
         if config.PREPROCESS_START_DATE:
             start_dt = pd.to_datetime(config.PREPROCESS_START_DATE)
             df = df[df['date'] >= start_dt]
-            print(f"Filtered data after start date ({config.PREPROCESS_START_DATE}): {df.shape}")
+            print(f"Filtered data after overall start date ({config.PREPROCESS_START_DATE}): {df.shape}")
         if config.PREPROCESS_END_DATE:
             end_dt = pd.to_datetime(config.PREPROCESS_END_DATE)
             df = df[df['date'] <= end_dt]
-            print(f"Filtered data after end date ({config.PREPROCESS_END_DATE}): {df.shape}")
+            print(f"Filtered data before overall end date ({config.PREPROCESS_END_DATE}): {df.shape}")
 
-        target_map = {"employed": 0, "unemployed": 1, "not_in_labor_force": 2}
-        target_map_inverse = {v: k for k, v in target_map.items()}
-        df['target_state'] = df['emp_state_f1'].map(target_map).astype('Int32')
+        # --- Time-based Split for HPT Validation ---
+        print("\nSplitting data for HPT validation...")
+        if not hasattr(config, 'HPT_VALIDATION_START_DATE') or not config.HPT_VALIDATION_START_DATE:
+            print("ERROR: config.HPT_VALIDATION_START_DATE is not defined. Cannot perform time-based split.")
+            sys.exit(1)
 
-        df['current_state'] = pd.Categorical(df['emp_state'], categories=target_map.keys())
+        hpt_val_start_dt = pd.to_datetime(config.HPT_VALIDATION_START_DATE)
+        print(f"Using HPT validation start date: {hpt_val_start_dt.date()}")
 
-        df['age'] = pd.to_numeric(df['age'], errors='coerce')
-        df['sex'] = pd.Categorical(df['sex'].map({1: "Male", 2: "Female"}))
+        data_for_fitting_raw = df[df['date'] < hpt_val_start_dt].copy()
+        hpt_val_data_raw = df[df['date'] >= hpt_val_start_dt].copy()
 
-        race_map = {
-            "100": "White", "200": "Black", "300": "NativeAmerican",
-            "651": "Asian", "652": "PacificIslander"
-        }
-        df['race_cat'] = pd.Categorical(df['race'].astype(str).map(race_map).fillna("Other/Mixed"))
+        print(f"Data for fitting/standard splits (before {hpt_val_start_dt.date()}): {data_for_fitting_raw.shape}")
+        print(f"Data for HPT validation (on/after {hpt_val_start_dt.date()}): {hpt_val_data_raw.shape}")
 
-        df['hispan_cat'] = np.select(
-            [
-                df['hispan'].astype(str).str.contains("not hispanic", case=False, na=False),
-                df['hispan'].notna() & ~df['hispan'].astype(str).str.contains("not hispanic", case=False, na=False)
-            ],
-            [
-                "NotHispanic", "Hispanic"
-            ],
-            default="Unknown"
-        )
-        df['hispan_cat'] = pd.Categorical(df['hispan_cat'])
+        if data_for_fitting_raw.empty:
+            print("ERROR: No data available before HPT_VALIDATION_START_DATE. Cannot proceed.")
+            sys.exit(1)
+        if hpt_val_data_raw.empty:
+            print("WARNING: No data available on/after HPT_VALIDATION_START_DATE for HPT validation set.")
+            # Proceed, but HPT evaluation might yield trivial results.
 
-        conditions = [
-            df['educ'].astype(str).str.contains("Advanced degree", case=False, na=False),
-            df['educ'].astype(str).str.contains("Bachelor's degree", case=False, na=False),
-            df['educ'].astype(str).str.contains("Some college", case=False, na=False),
-            df['educ'].notna()
-        ]
-        choices = [
-            "Advanced",
-            "Bachelors",
-            "Some_College",
-            "HS_or_less"
-        ]
-        df['educ_cat'] = np.select(conditions, choices, default="HS_or_less")
-        educ_categories = ["HS_or_less", "Some_College", "Bachelors", "Advanced"]
-        df['educ_cat'] = pd.Categorical(df['educ_cat'], categories=educ_categories, ordered=False)
+        # --- Continue Cleaning and Feature Engineering (on both splits if needed, or apply functions) ---
+        # Apply cleaning/feature engineering steps consistently.
+        # It's often easier to do this on the combined dataframe 'df' before splitting,
+        # but ensure features like 'months_since_last' are calculated correctly after sorting.
+        # Let's re-apply the cleaning steps to the split dataframes to be safe.
 
-        df['statefip'] = df['statefip'].astype(float).astype(int).astype(str).str.zfill(2)
-        df['statefip'] = pd.Categorical(df['statefip'])
+        def apply_cleaning(input_df):
+            temp_df = input_df.copy()
+            target_map = {"employed": 0, "unemployed": 1, "not_in_labor_force": 2}
+            temp_df['target_state'] = temp_df['emp_state_f1'].map(target_map).astype('Int32')
+            temp_df['current_state'] = pd.Categorical(temp_df['emp_state'], categories=target_map.keys())
+            temp_df['age'] = pd.to_numeric(temp_df['age'], errors='coerce')
+            temp_df['sex'] = pd.Categorical(temp_df['sex'].map({1: "Male", 2: "Female"}))
+            race_map = {
+                "100": "White", "200": "Black", "300": "NativeAmerican",
+                "651": "Asian", "652": "PacificIslander"
+            }
+            temp_df['race_cat'] = pd.Categorical(temp_df['race'].astype(str).map(race_map).fillna("Other/Mixed"))
+            temp_df['hispan_cat'] = np.select(
+                [
+                    temp_df['hispan'].astype(str).str.contains("not hispanic", case=False, na=False),
+                    temp_df['hispan'].notna() & ~temp_df['hispan'].astype(str).str.contains("not hispanic", case=False, na=False)
+                ],
+                ["NotHispanic", "Hispanic"], default="Unknown"
+            )
+            temp_df['hispan_cat'] = pd.Categorical(temp_df['hispan_cat'])
+            conditions = [
+                temp_df['educ'].astype(str).str.contains("Advanced degree", case=False, na=False),
+                temp_df['educ'].astype(str).str.contains("Bachelor's degree", case=False, na=False),
+                temp_df['educ'].astype(str).str.contains("Some college", case=False, na=False),
+                temp_df['educ'].notna()
+            ]
+            choices = ["Advanced", "Bachelors", "Some_College", "HS_or_less"]
+            temp_df['educ_cat'] = np.select(conditions, choices, default="HS_or_less")
+            educ_categories = ["HS_or_less", "Some_College", "Bachelors", "Advanced"]
+            temp_df['educ_cat'] = pd.Categorical(temp_df['educ_cat'], categories=educ_categories, ordered=False)
+            temp_df['statefip'] = temp_df['statefip'].astype(float).astype(int).astype(str).str.zfill(2)
+            temp_df['statefip'] = pd.Categorical(temp_df['statefip'])
+            temp_df['faminc_cat'] = clean_faminc(temp_df['faminc'].astype(str))
+            temp_df['whyunemp'] = "Not_Unemployed"
+            unemployed_mask = temp_df['current_state'] == "unemployed"
+            temp_df.loc[unemployed_mask, 'whyunemp'] = temp_df.loc[unemployed_mask, 'whyunemp'].astype(str) # Ensure string type before categorizing
+            temp_df['whyunemp'] = pd.Categorical(temp_df['whyunemp'])
+            temp_df['ahrsworkt_cat'] = "Not_Employed"
+            employed_mask = temp_df['current_state'] == "employed"
+            temp_df.loc[employed_mask, 'ahrsworkt_cat'] = temp_df.loc[employed_mask, 'ahrsworkt'].astype(str)
+            temp_df.loc[temp_df['ahrsworkt_cat'].isin(['nan', 'NA', '']), 'ahrsworkt_cat'] = "Unknown_Hours"
+            temp_df['ahrsworkt_cat'] = temp_df['ahrsworkt_cat'].str.replace("40+", "40plus", regex=False)
+            temp_df['ahrsworkt_cat'] = pd.Categorical(temp_df['ahrsworkt_cat'])
+            temp_df['durunemp'] = pd.to_numeric(temp_df['durunemp'], errors='coerce')
+            temp_df.loc[temp_df['current_state'] != "unemployed", 'durunemp'] = 0
+            temp_df['ind_group_cat'] = temp_df['ind_group'].astype(str).replace(['', 'nan'], 'Unknown')
+            temp_df['ind_group_cat'] = pd.Categorical(temp_df['ind_group_cat'])
+            temp_df['occ_2dig_cat'] = temp_df['occ_2dig'].astype(str).replace(['', 'nan', '99'], 'Unknown')
+            occ_mask = temp_df['occ_2dig_cat'] != 'Unknown'
+            # Ensure numeric conversion before zfill
+            numeric_occ = pd.to_numeric(temp_df.loc[occ_mask, 'occ_2dig_cat'], errors='coerce')
+            temp_df.loc[occ_mask & numeric_occ.notna(), 'occ_2dig_cat'] = 'Occ' + numeric_occ[numeric_occ.notna()].astype(int).astype(str).str.zfill(2)
+            temp_df['occ_2dig_cat'] = pd.Categorical(temp_df['occ_2dig_cat'])
+            temp_df['mth_dim1'] = pd.to_numeric(temp_df['mth_dim1'], errors='coerce')
+            temp_df['mth_dim2'] = pd.to_numeric(temp_df['mth_dim2'], errors='coerce')
+            temp_df = temp_df.sort_values(['cpsidp', 'date'])
+            temp_df['time_diff_days'] = temp_df.groupby('cpsidp')['date'].diff().dt.days
+            temp_df['months_since_last'] = (temp_df['time_diff_days'] / 30.4375).round()
+            temp_df['months_since_last'] = temp_df['months_since_last'].fillna(0).astype(int)
+            # Ensure wtfinl is numeric
+            temp_df['wtfinl'] = pd.to_numeric(temp_df['wtfinl'], errors='coerce').fillna(0)
+            return temp_df, target_map # Return map as well
 
-        df['faminc_cat'] = clean_faminc(df['faminc'].astype(str))
+        print("Applying cleaning steps to 'data_for_fitting_raw'...")
+        data_for_fitting_clean, target_map = apply_cleaning(data_for_fitting_raw)
+        target_map_inverse = {v: k for k, v in target_map.items()} # Get inverse map
 
-        df['whyunemp'] = "Not_Unemployed"
-        unemployed_mask = df['current_state'] == "unemployed"
-        df.loc[unemployed_mask, 'whyunemp'] = df.loc[unemployed_mask, 'whyunemp'].astype(str)
-        df['whyunemp'] = pd.Categorical(df['whyunemp'])
-
-        df['ahrsworkt_cat'] = "Not_Employed"
-        employed_mask = df['current_state'] == "employed"
-        df.loc[employed_mask, 'ahrsworkt_cat'] = df.loc[employed_mask, 'ahrsworkt'].astype(str)
-        df.loc[df['ahrsworkt_cat'].isin(['nan', 'NA', '']), 'ahrsworkt_cat'] = "Unknown_Hours"
-        df['ahrsworkt_cat'] = df['ahrsworkt_cat'].str.replace("40+", "40plus", regex=False)
-        df['ahrsworkt_cat'] = pd.Categorical(df['ahrsworkt_cat'])
-
-        df['durunemp'] = pd.to_numeric(df['durunemp'], errors='coerce')
-        df.loc[df['current_state'] != "unemployed", 'durunemp'] = 0
-
-        df['ind_group_cat'] = df['ind_group'].astype(str).replace(['', 'nan'], 'Unknown')
-        df['ind_group_cat'] = pd.Categorical(df['ind_group_cat'])
-
-        df['occ_2dig_cat'] = df['occ_2dig'].astype(str).replace(['', 'nan', '99'], 'Unknown')
-        occ_mask = df['occ_2dig_cat'] != 'Unknown'
-        df.loc[occ_mask, 'occ_2dig_cat'] = 'Occ' + pd.to_numeric(df.loc[occ_mask, 'occ_2dig_cat'], errors='coerce').astype(int).astype(str).str.zfill(2)
-        df['occ_2dig_cat'] = pd.Categorical(df['occ_2dig_cat'])
-
-        df['mth_dim1'] = pd.to_numeric(df['mth_dim1'], errors='coerce')
-        df['mth_dim2'] = pd.to_numeric(df['mth_dim2'], errors='coerce')
-
-        df = df.sort_values(['cpsidp', 'date'])
-        df['time_diff_days'] = df.groupby('cpsidp')['date'].diff().dt.days
-        df['months_since_last'] = (df['time_diff_days'] / 30.4375).round()
-        df['months_since_last'] = df['months_since_last'].fillna(0).astype(int)
+        print("Applying cleaning steps to 'hpt_val_data_raw'...")
+        hpt_val_data_clean, _ = apply_cleaning(hpt_val_data_raw)
 
     except Exception as e:
-        print(f"ERROR during data cleaning: {e}")
+        print(f"ERROR during data cleaning or time splitting: {e}")
         raise
 
     # --- 2. Define Columns & Create Final DF ---
@@ -181,47 +203,84 @@ def preprocess_data():
         'ind_group_unemp_rate', 'ind_group_emp_rate'
     ]
     original_id_cols = ['statefip', 'ind_group_cat']
-    base_id_cols = ['cpsidp', 'date', 'target_state']
+    # Add wtfinl to base_id_cols
+    base_id_cols = ['cpsidp', 'date', 'target_state', 'wtfinl']
 
-    # Ensure original ID columns are present
-    missing_orig_ids = [col for col in original_id_cols if col not in df.columns]
-    if missing_orig_ids:
-        raise ValueError(f"Missing original identifier columns needed for forecasting: {missing_orig_ids}")
+    # Ensure original ID columns and wtfinl are present in both dataframes
+    missing_orig_ids_fit = [col for col in original_id_cols if col not in data_for_fitting_clean.columns]
+    missing_orig_ids_hpt = [col for col in original_id_cols if col not in hpt_val_data_clean.columns]
+    if 'wtfinl' not in data_for_fitting_clean.columns: missing_orig_ids_fit.append('wtfinl')
+    if not hpt_val_data_clean.empty and 'wtfinl' not in hpt_val_data_clean.columns: missing_orig_ids_hpt.append('wtfinl')
+
+    if missing_orig_ids_fit or missing_orig_ids_hpt:
+        raise ValueError(f"Missing original identifier or weight columns needed: Fit({missing_orig_ids_fit}), HPT({missing_orig_ids_hpt})")
 
     # Columns to keep before processing
     keep_cols = list(dict.fromkeys(base_id_cols + predictor_cols + original_id_cols))
-    df_final = df[keep_cols].copy()
-    print(f"Data shape before preprocessing: {df_final.shape}")
+
+    # Select columns for both dataframes
+    df_final_fit = data_for_fitting_clean[keep_cols].copy()
+    df_final_hpt = hpt_val_data_clean[keep_cols].copy() if not hpt_val_data_clean.empty else pd.DataFrame(columns=keep_cols)
+
+    print(f"Data shape for fitting before preprocessing: {df_final_fit.shape}")
+    print(f"Data shape for HPT validation before preprocessing: {df_final_hpt.shape}")
     print(f"Predictor columns for pipeline: {predictor_cols}")
     print(f"Original ID columns kept: {original_id_cols}")
 
-    # --- 3. Handle Sparse Categories (on full data before fitting pipeline) ---
-    print("\n===== STEP 3: Grouping Sparse Categorical Features (on Full Data) =====")
-    potential_categorical_features = df_final[predictor_cols].select_dtypes(include=['category', 'object']).columns.tolist()
+    # --- 3. Handle Sparse Categories (on fitting data only) ---
+    print("\n===== STEP 3: Grouping Sparse Categorical Features (on Fitting Data) =====")
+    potential_categorical_features = df_final_fit[predictor_cols].select_dtypes(include=['category', 'object']).columns.tolist()
     print(f"Identified potential categorical features for sparsity check: {potential_categorical_features}")
     sparsity_threshold = getattr(config, 'SPARSITY_THRESHOLD', 0.01)
     print(f"Using sparsity threshold: {sparsity_threshold}")
 
-    if sparsity_threshold > 0 and not df_final.empty:
+    sparse_categories_map = {} # Store sparse categories found in fitting data
+    if sparsity_threshold > 0 and not df_final_fit.empty:
         for col in potential_categorical_features:
-            frequencies = df_final[col].value_counts(normalize=True)
+            frequencies = df_final_fit[col].value_counts(normalize=True)
             sparse_cats = frequencies[frequencies < sparsity_threshold].index.tolist()
             if sparse_cats:
                 print(f"  Grouping sparse categories in '{col}': {sparse_cats}")
                 other_category = "_OTHER_"
-                if pd.api.types.is_categorical_dtype(df_final[col]):
-                    if other_category not in df_final[col].cat.categories:
-                        df_final[col] = df_final[col].cat.add_categories([other_category])
-                    df_final[col] = df_final[col].replace(sparse_cats, other_category)
-                else:
-                    df_final[col] = df_final[col].replace(sparse_cats, other_category)
+                sparse_categories_map[col] = sparse_cats # Store for applying to HPT data
+
+                # Apply to fitting data
+                if pd.api.types.is_categorical_dtype(df_final_fit[col]):
+                    if other_category not in df_final_fit[col].cat.categories:
+                        df_final_fit[col] = df_final_fit[col].cat.add_categories([other_category])
+                    df_final_fit[col] = df_final_fit[col].replace(sparse_cats, other_category)
+                else: # Should be categorical, but handle object type just in case
+                    df_final_fit[col] = df_final_fit[col].replace(sparse_cats, other_category)
+                    # Convert back to categorical if needed, ensuring _OTHER_ is included
+                    all_cats = df_final_fit[col].unique().tolist()
+                    df_final_fit[col] = pd.Categorical(df_final_fit[col], categories=all_cats)
+
+        # Apply the same grouping to HPT validation data
+        print("Applying sparse category grouping to HPT validation data...")
+        if not df_final_hpt.empty:
+            for col, sparse_cats in sparse_categories_map.items():
+                if col in df_final_hpt.columns:
+                    other_category = "_OTHER_"
+                    # Ensure the category exists before replacing
+                    if pd.api.types.is_categorical_dtype(df_final_hpt[col]):
+                         if other_category not in df_final_hpt[col].cat.categories:
+                              df_final_hpt[col] = df_final_hpt[col].cat.add_categories([other_category])
+                         # Replace only categories that exist in this split's column
+                         cats_to_replace = [cat for cat in sparse_cats if cat in df_final_hpt[col].cat.categories]
+                         if cats_to_replace:
+                              df_final_hpt[col] = df_final_hpt[col].replace(cats_to_replace, other_category)
+                    else: # Object type
+                         df_final_hpt[col] = df_final_hpt[col].replace(sparse_cats, other_category)
+                         all_cats_hpt = df_final_hpt[col].unique().tolist()
+                         df_final_hpt[col] = pd.Categorical(df_final_hpt[col], categories=all_cats_hpt)
+
     else:
         print("Skipping sparse category grouping.")
 
-    # --- 4. Define and Fit Preprocessing Pipeline (on full data) ---
-    print("\n===== STEP 4: Defining and Fitting Preprocessing Pipeline (on Full Data) =====")
-    numeric_features = df_final[predictor_cols].select_dtypes(include=np.number).columns.tolist()
-    categorical_features = df_final[predictor_cols].select_dtypes(include=['category', 'object']).columns.tolist()
+    # --- 4. Define and Fit Preprocessing Pipeline (on fitting data only) ---
+    print("\n===== STEP 4: Defining and Fitting Preprocessing Pipeline (on Fitting Data) =====")
+    numeric_features = df_final_fit[predictor_cols].select_dtypes(include=np.number).columns.tolist()
+    categorical_features = df_final_fit[predictor_cols].select_dtypes(include=['category', 'object']).columns.tolist()
     print(f"Numeric features: {numeric_features}")
     print(f"Categorical features: {categorical_features}")
 
@@ -231,10 +290,13 @@ def preprocess_data():
     preprocessor = ColumnTransformer(transformers=[('num', numeric_transformer, numeric_features), ('cat', categorical_transformer, categorical_features)], remainder='drop')
     full_pipeline = Pipeline(steps=[('preprocess', preprocessor), ('variance_threshold', VarianceThreshold(threshold=0))])
 
-    # Fit the pipeline on ALL data's predictor columns
-    print("Fitting pipeline...")
+    # Fit the pipeline ONLY on the fitting data's predictor columns
+    print("Fitting pipeline on data before HPT validation period...")
     try:
-        full_pipeline.fit(df_final[predictor_cols], df_final['target_state']) # Fit on all predictors
+        # Ensure target_state exists and is not all NaN before fitting
+        if 'target_state' not in df_final_fit.columns or df_final_fit['target_state'].isnull().all():
+             raise ValueError("Target state column is missing or all NaN in the fitting data.")
+        full_pipeline.fit(df_final_fit[predictor_cols], df_final_fit['target_state'])
     except Exception as e:
         print(f"ERROR fitting pipeline: {e}")
         raise
@@ -246,11 +308,22 @@ def preprocess_data():
         print(f"Preprocessing pipeline saved to: {preprocessor_file}")
     except Exception as e: print(f"ERROR saving preprocessor: {e}")
 
-    # --- 5. Apply Pipeline to All Data ---
-    print("\n===== STEP 5: Applying Pipeline to Full Data =====")
-    X_full_baked_np = full_pipeline.transform(df_final[predictor_cols])
+    # --- 5. Apply Pipeline to Both Splits ---
+    print("\n===== STEP 5: Applying Pipeline to Fitting Data and HPT Validation Data =====")
+    print("Applying pipeline to fitting data...")
+    X_fit_baked_np = full_pipeline.transform(df_final_fit[predictor_cols])
 
-    # Get feature names after transformation
+    print("Applying pipeline to HPT validation data...")
+    X_hpt_baked_np = np.array([]).reshape(0, X_fit_baked_np.shape[1]) # Initialize empty with correct columns
+    if not df_final_hpt.empty:
+        try:
+            X_hpt_baked_np = full_pipeline.transform(df_final_hpt[predictor_cols])
+        except Exception as e:
+            print(f"ERROR applying pipeline to HPT validation data: {e}")
+            # Decide how to handle: stop, or continue with empty HPT set? Let's stop.
+            raise
+
+    # Get feature names after transformation (from the fitted pipeline)
     try:
         col_transformer = full_pipeline.named_steps['preprocess']
         final_feature_names = col_transformer.get_feature_names_out()
@@ -260,45 +333,54 @@ def preprocess_data():
         print(f"Number of features after preprocessing: {len(final_feature_names_after_vt)}")
     except Exception as e:
         print(f"Warning: Could not retrieve feature names from pipeline: {e}")
-        final_feature_names_after_vt = [f"feature_{i}" for i in range(X_full_baked_np.shape[1])]
+        final_feature_names_after_vt = [f"feature_{i}" for i in range(X_fit_baked_np.shape[1])]
 
-    # Create the full baked DataFrame
-    full_baked_df = pd.DataFrame(X_full_baked_np, columns=final_feature_names_after_vt, index=df_final.index)
+    # Create the baked DataFrames
+    fit_baked_df = pd.DataFrame(X_fit_baked_np, columns=final_feature_names_after_vt, index=df_final_fit.index)
+    hpt_baked_df = pd.DataFrame(X_hpt_baked_np, columns=final_feature_names_after_vt, index=df_final_hpt.index) if not df_final_hpt.empty else pd.DataFrame(columns=final_feature_names_after_vt)
+
     # Add back base IDs and original IDs
     id_cols_to_add = base_id_cols + original_id_cols
-    full_baked_df = pd.concat([df_final[id_cols_to_add], full_baked_df], axis=1)
-    print(f"Full baked data shape: {full_baked_df.shape}")
+    fit_baked_df = pd.concat([df_final_fit[id_cols_to_add], fit_baked_df], axis=1)
+    if not df_final_hpt.empty:
+        hpt_baked_df = pd.concat([df_final_hpt[id_cols_to_add], hpt_baked_df], axis=1)
 
-    # --- 6. Save Full Baked Data ---
-    print("\n===== STEP 6: Saving Full Baked Data =====")
-    try:
-        full_baked_df.to_parquet(full_baked_file, index=False)
-        print(f"Full baked data saved to: {full_baked_file}")
-    except Exception as e:
-        print(f"ERROR saving full baked data: {e}")
+    print(f"Fitting data baked shape: {fit_baked_df.shape}")
+    print(f"HPT validation data baked shape: {hpt_baked_df.shape}")
 
-    # --- 7. Sample Individuals (if specified) ---
-    print("\n===== STEP 7: Sampling Individuals for Training Splits =====")
-    all_person_ids = df_final['cpsidp'].unique()
-    n_all_persons = len(all_person_ids)
-    sampled_ids = all_person_ids # Default to all IDs
+    # --- 6. Save HPT Validation Baked Data ---
+    print("\n===== STEP 6: Saving HPT Validation Baked Data =====")
+    if not hpt_baked_df.empty:
+        try:
+            hpt_baked_df.to_parquet(hpt_val_file, index=False)
+            print(f"HPT validation baked data saved to: {hpt_val_file}")
+        except Exception as e:
+            print(f"ERROR saving HPT validation baked data: {e}")
+    else:
+        print("HPT validation data is empty, not saving file.")
+
+    # --- 7. Sample Individuals (from fitting data only) ---
+    print("\n===== STEP 7: Sampling Individuals for Training Splits (from Fitting Data) =====")
+    all_person_ids_fit = fit_baked_df['cpsidp'].unique()
+    n_all_persons_fit = len(all_person_ids_fit)
+    sampled_ids = all_person_ids_fit # Default to all IDs from the fitting period
 
     if config.PREPROCESS_NUM_INDIVIDUALS is not None and config.PREPROCESS_NUM_INDIVIDUALS > 0:
-        if config.PREPROCESS_NUM_INDIVIDUALS >= n_all_persons:
-            print(f"Requested {config.PREPROCESS_NUM_INDIVIDUALS} individuals, have {n_all_persons}. Using all available.")
+        if config.PREPROCESS_NUM_INDIVIDUALS >= n_all_persons_fit:
+            print(f"Requested {config.PREPROCESS_NUM_INDIVIDUALS} individuals, have {n_all_persons_fit} in fitting period. Using all available.")
         else:
-            print(f"Sampling {config.PREPROCESS_NUM_INDIVIDUALS} individuals from {n_all_persons} available...")
-            sampled_ids = np.random.choice(all_person_ids, config.PREPROCESS_NUM_INDIVIDUALS, replace=False)
+            print(f"Sampling {config.PREPROCESS_NUM_INDIVIDUALS} individuals from {n_all_persons_fit} available in fitting period...")
+            sampled_ids = np.random.choice(all_person_ids_fit, config.PREPROCESS_NUM_INDIVIDUALS, replace=False)
             print(f"Selected {len(sampled_ids)} individuals for training/val/test splits.")
     else:
-        print("PREPROCESS_NUM_INDIVIDUALS not set or <= 0. Using all individuals for splits.")
+        print("PREPROCESS_NUM_INDIVIDUALS not set or <= 0. Using all individuals from fitting period for splits.")
 
     n_sampled_persons = len(sampled_ids)
 
     # --- 8. Split Sampled IDs into Train/Val/Test ---
     print("\n===== STEP 8: Splitting Sampled Individual IDs =====")
     if n_sampled_persons == 0:
-        print("ERROR: No individuals available after potential sampling. Cannot create splits.")
+        print("ERROR: No individuals available from fitting data after potential sampling. Cannot create splits.")
         return
 
     train_size = int(config.TRAIN_SPLIT * n_sampled_persons)
@@ -322,11 +404,11 @@ def preprocess_data():
 
     print(f"Sampled Individuals Split - Train: {len(train_ids)}, Validation: {len(val_ids)}, Test: {len(test_ids)}")
 
-    # --- 9. Filter Full Baked Data to Create Splits ---
-    print("\n===== STEP 9: Creating Data Splits from Full Baked Data =====")
-    train_data_baked = full_baked_df[full_baked_df['cpsidp'].isin(train_ids)].copy()
-    val_data_baked = full_baked_df[full_baked_df['cpsidp'].isin(val_ids)].copy() if len(val_ids) > 0 else pd.DataFrame(columns=full_baked_df.columns)
-    test_data_baked = full_baked_df[full_baked_df['cpsidp'].isin(test_ids)].copy() if len(test_ids) > 0 else pd.DataFrame(columns=full_baked_df.columns)
+    # --- 9. Filter Baked Fitting Data to Create Splits ---
+    print("\n===== STEP 9: Creating Data Splits from Baked Fitting Data =====")
+    train_data_baked = fit_baked_df[fit_baked_df['cpsidp'].isin(train_ids)].copy()
+    val_data_baked = fit_baked_df[fit_baked_df['cpsidp'].isin(val_ids)].copy() if len(val_ids) > 0 else pd.DataFrame(columns=fit_baked_df.columns)
+    test_data_baked = fit_baked_df[fit_baked_df['cpsidp'].isin(test_ids)].copy() if len(test_ids) > 0 else pd.DataFrame(columns=fit_baked_df.columns)
 
     print(f"Shape of final baked train data (sampled): {train_data_baked.shape}")
     print(f"Shape of final baked val data (sampled): {val_data_baked.shape}")
@@ -349,13 +431,13 @@ def preprocess_data():
     print("\n===== STEP 11: Saving Metadata =====")
     n_features = len(final_feature_names_after_vt)
 
-    print("Calculating n_classes from target_state column...")
-    unique_target_values_inc_na = df_final['target_state'].unique()
+    print("Calculating n_classes from target_state column in fitting data...")
+    unique_target_values_inc_na = df_final_fit['target_state'].unique()
     valid_target_values = unique_target_values_inc_na[~pd.isna(unique_target_values_inc_na)]
     n_classes = len(valid_target_values)
     print(f"Final calculated n_classes: {n_classes}")
-    if len(df_final) > 0 and n_classes == 0: # Check if df_final is not empty
-        print("WARNING: Target state column appears to be all NA values or the cleaned dataframe is empty.")
+    if len(df_final_fit) > 0 and n_classes == 0: # Check if df_final is not empty
+        print("WARNING: Target state column appears to be all NA values or the cleaned fitting dataframe is empty.")
         print("STOPPING: Cannot determine n_classes.")
         return # Stop execution
     elif n_classes != 3:
@@ -379,8 +461,11 @@ def preprocess_data():
         'train_rows_baked': len(train_data_baked),
         'val_rows_baked': len(val_data_baked),
         'test_rows_baked': len(test_data_baked),
+        'hpt_val_rows_baked': len(hpt_baked_df), # Add count for HPT val set
         'preprocessing_pipeline_path': str(preprocessor_file),
-        'full_baked_data_path': str(full_baked_file) # Add path to the full data
+        'hpt_validation_data_path': str(hpt_val_file) if hpt_val_file.exists() else None, # Add path to HPT val data
+        'full_baked_data_path': str(full_baked_file), # Add path to the full data
+        'weight_column': 'wtfinl' # Add weight column name to metadata
     }
 
     try:

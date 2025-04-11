@@ -23,11 +23,16 @@ PREPROCESS_NUM_INDIVIDUALS = 200000 # Integer or None
 TRAIN_SPLIT = 0.7
 VAL_SPLIT = 0.15
 # Test split is implicitly 1 - TRAIN_SPLIT - VAL_SPLIT
+SPARSITY_THRESHOLD = 0.01 # Threshold for grouping sparse categorical features
+
+# Time-based split for HPT validation
+HPT_VALIDATION_START_DATE = "2018-01-01" # Data from this date onwards used for HPT validation metric
 
 # Derived Preprocessing Output Filenames (used by training script)
 TRAIN_DATA_FILENAME = "train_baked.parquet"
 VAL_DATA_FILENAME = "val_baked.parquet"
 TEST_DATA_FILENAME = "test_baked.parquet"
+HPT_VAL_DATA_FILENAME = "hpt_val_data.parquet" # Filename for HPT validation data
 METADATA_FILENAME = "preprocessing_metadata.pkl"
 RECIPE_FILENAME = "preprocessing_recipe.pkl" # Although not created by preprocess, it's related
 FULL_DATA_FILENAME = "full_baked.parquet" # New filename for all processed data
@@ -38,10 +43,10 @@ TRAIN_OUTPUT_SUBDIR = PROJECT_ROOT / "models/transformer_pytorch" # Removed /sta
 SEQUENCE_CACHE_DIR_NAME = "sequence_cache_py" # Relative to PREPROCESS_OUTPUT_DIR
 # Add date filtering for training data (applied *after* loading baked data)
 TRAIN_START_DATE = None # "YYYY-MM-DD" or None to use all available data before TRAIN_END_DATE
-TRAIN_END_DATE = "2022-12-31"   # "YYYY-MM-DD" or None to use all available data after TRAIN_START_DATE
+TRAIN_END_DATE = "2019-12-31"   # "YYYY-MM-DD" or None to use all available data after TRAIN_START_DATE
 
 # Model Hyperparameters
-SEQUENCE_LENGTH = 12
+SEQUENCE_LENGTH = 24 # Fixed sequence length
 EMBED_DIM = 64
 NUM_HEADS = 4
 FF_DIM = 64 # Feed-forward inner dim in transformer block
@@ -78,8 +83,8 @@ HPT_STUDY_NAME = "transformer_hpt_study" # Name for the Optuna study database fi
 HPT_EPOCHS = 3 # Number of epochs to run *per trial* during HPT (usually fewer than EPOCHS)
 
 # HPT Search Space Definitions
-HPT_SEQ_LEN_MIN = 6
-HPT_SEQ_LEN_MAX = 24
+# HPT_SEQ_LEN_MIN = 6 # Removed
+# HPT_SEQ_LEN_MAX = 24 # Removed
 HPT_EMBED_DIM_OPTIONS = [32, 64, 128]
 HPT_NUM_HEADS_OPTIONS = [2, 4, 8] # Must divide embed_dim
 HPT_FF_DIM_MIN = 32
@@ -98,6 +103,7 @@ HPT_LR_MIN = 1e-5
 HPT_LR_MAX = 1e-3
 HPT_BATCH_SIZE_OPTIONS = [32, 64, 128]
 HPT_USE_WEIGHTED_LOSS_OPTIONS = [True, False]
+HPT_USE_WEIGHTED_SAMPLING_OPTIONS = [True, False] # Options for weighted sampling during HPT
 
 # HPT Pruner Settings
 HPT_PRUNER_STARTUP = 5 # Number of trials before pruning starts
