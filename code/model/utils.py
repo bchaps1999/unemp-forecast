@@ -246,8 +246,8 @@ class SequenceDataset(Dataset):
         return x, y, w, padding_mask # Return weight
 
 # --- Data Loading and Preparation ---
-def load_and_prepare_data(train_file, val_file, hpt_val_file, metadata_file, date_col, group_id_col, train_start_date=None, train_end_date=None):
-    """Loads data, metadata, performs checks, and applies date filters."""
+def load_and_prepare_data(train_file, val_file, hpt_val_file, metadata_file, date_col, group_id_col): # Removed train_start_date, train_end_date
+    """Loads data, metadata, performs checks.""" # Removed date filter mention
     print("\n===== STEP 1: Loading Preprocessed Data & Metadata =====")
     # --- Input Checks ---
     required_files = [train_file, val_file, metadata_file]
@@ -304,8 +304,8 @@ def load_and_prepare_data(train_file, val_file, hpt_val_file, metadata_file, dat
          traceback.print_exc()
          raise
 
-    # --- Filter Baked Data by Date ---
-    print("\nFiltering data based on date range (if specified)...")
+    # --- Filter Baked Data by Date --- # REMOVED FILTERING LOGIC
+    # print("\nFiltering data based on date range (if specified)...") # Removed print
     try:
         train_data_baked[date_col] = pd.to_datetime(train_data_baked[date_col])
         val_data_baked[date_col] = pd.to_datetime(val_data_baked[date_col])
@@ -316,42 +316,10 @@ def load_and_prepare_data(train_file, val_file, hpt_val_file, metadata_file, dat
         traceback.print_exc()
         raise
 
-    initial_train_rows = len(train_data_baked)
-    initial_val_rows = len(val_data_baked)
-    initial_hpt_val_rows = len(hpt_val_data_baked) if hpt_val_data_baked is not None else 0
-
-    if train_start_date:
-        try:
-            train_start_dt = pd.to_datetime(train_start_date)
-            train_data_baked = train_data_baked[train_data_baked[date_col] >= train_start_dt].copy()
-            val_data_baked = val_data_baked[val_data_baked[date_col] >= train_start_dt].copy()
-            # Apply start date to HPT val data as well (though less common use case)
-            if hpt_val_data_baked is not None:
-                hpt_val_data_baked = hpt_val_data_baked[hpt_val_data_baked[date_col] >= train_start_dt].copy()
-            print(f"Applied TRAIN_START_DATE >= {train_start_date}")
-        except Exception as e:
-            print(f"Warning: Could not apply train_start_date filter: {e}")
-
-    if train_end_date:
-        try:
-            train_end_dt = pd.to_datetime(train_end_date)
-            train_data_baked = train_data_baked[train_data_baked[date_col] <= train_end_dt].copy()
-            val_data_baked = val_data_baked[val_data_baked[date_col] <= train_end_dt].copy()
-            # Apply end date filter to HPT validation data
-            if hpt_val_data_baked is not None:
-                hpt_val_data_baked = hpt_val_data_baked[hpt_val_data_baked[date_col] <= train_end_dt].copy()
-            print(f"Applied TRAIN_END_DATE <= {train_end_date}")
-        except Exception as e:
-            print(f"Warning: Could not apply train_end_date filter: {e}")
-
-    print(f"Train data rows: {initial_train_rows} -> {len(train_data_baked)}")
-    print(f"Validation data rows: {initial_val_rows} -> {len(val_data_baked)}")
-    if hpt_val_data_baked is not None:
-        print(f"HPT Validation data rows: {initial_hpt_val_rows} -> {len(hpt_val_data_baked)}") # Show filtered count
     if len(train_data_baked) == 0 or len(val_data_baked) == 0:
-         raise ValueError("No data remaining after date filtering for train/val splits.")
+         raise ValueError("No data remaining after loading for train/val splits.") # Updated error message
     if hpt_val_data_baked is not None and len(hpt_val_data_baked) == 0:
-         print("Warning: No data remaining in HPT validation set after date filtering.")
+         print("Warning: No data remaining in HPT validation set after loading.") # Updated message
 
     return train_data_baked, val_data_baked, hpt_val_data_baked, metadata, feature_names, n_features, n_classes
 
@@ -379,9 +347,20 @@ def setup_sequence_generation(hparams, train_data_baked, val_data_baked, hpt_val
     sequence_cache_base_dir = processed_data_dir / sequence_cache_dir_name
     sequence_cache_dir = sequence_cache_base_dir / f"seqlen_{seq_len}"
     sequence_cache_dir.mkdir(parents=True, exist_ok=True)
-    train_seq_cache_file = sequence_cache_dir / "train_sequences.npz"
-    val_seq_cache_file = sequence_cache_dir / "val_sequences.npz"
-    hpt_val_seq_cache_file = sequence_cache_dir / "hpt_val_sequences.npz" # Cache for HPT val
+
+    # Calculate number of individuals for cache filenames
+    num_train_individuals = train_data_baked[group_id_col].nunique() if train_data_baked is not None and not train_data_baked.empty else 0
+    num_val_individuals = val_data_baked[group_id_col].nunique() if val_data_baked is not None and not val_data_baked.empty else 0
+    num_hpt_val_individuals = hpt_val_data_baked[group_id_col].nunique() if hpt_val_data_baked is not None and not hpt_val_data_baked.empty else 0
+
+    # Construct cache filenames including individual counts
+    train_seq_cache_file = sequence_cache_dir / f"train_sequences_N{num_train_individuals}.npz"
+    val_seq_cache_file = sequence_cache_dir / f"val_sequences_N{num_val_individuals}.npz"
+    hpt_val_seq_cache_file = sequence_cache_dir / f"hpt_val_sequences_N{num_hpt_val_individuals}.npz"
+    print(f"Using cache directory: {sequence_cache_dir}")
+    print(f" - Train cache file: {train_seq_cache_file.name}")
+    print(f" - Val cache file: {val_seq_cache_file.name}")
+    print(f" - HPT Val cache file: {hpt_val_seq_cache_file.name}")
 
     # Helper function for sequence generation/caching for a split
     def process_split_py(split_name, baked_data, cache_file):

@@ -60,11 +60,11 @@ def main():
     print("\n--- Loading Model and Data ---")
     try:
         model, params, metadata = load_pytorch_model_and_params(model_dir, processed_data_dir, DEVICE)
-        # Load data for forecasting - no longer returns historical_rates_df
+        # Load data for forecasting - uses TEST data, requires FULL TRAIN for history
         initial_sim_data_df, simulation_start_period, _ = load_forecasting_data(
             processed_data_dir, metadata, config.FORECAST_START_YEAR, config.FORECAST_START_MONTH
         )
-        print(f"Data loaded. Simulation will start from period: {simulation_start_period}")
+        print(f"Data loaded. Simulation will start from period: {simulation_start_period} (first period in test set or specified)")
 
         # --- Define output paths now that simulation_start_period is known ---
         start_period_str = str(simulation_start_period) # e.g., "202312"

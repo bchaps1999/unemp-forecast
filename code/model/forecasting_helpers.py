@@ -85,75 +85,80 @@ def load_pytorch_model_and_params(model_dir: Path, processed_data_dir: Path, dev
     return model, params, metadata
 
 def load_forecasting_data(processed_data_dir: Path, metadata: dict, start_year: int = None, start_month: int = None):
-    """Loads the FULL baked data for simulation start.
-       Filters data based on specified start_year and start_month if provided, otherwise uses the latest period.
-       Historical rates are now loaded separately.
+    """Loads the TEST baked data (which includes lookback history) for simulation start.
+       Filters data based on specified start_year and start_month if provided,
+       otherwise uses the EARLIEST period in the test set's actual forecast range.
     """
-    print("Loading data for forecasting...")
-    # --- Load FULL Baked Data ---
-    full_baked_path = processed_data_dir / config.FULL_DATA_FILENAME
-    if not full_baked_path.exists():
-         raise FileNotFoundError(f"Required full baked data file not found at {full_baked_path}. Please ensure the preprocessing script ran successfully and saved the file.")
+    print("Loading data for forecasting initialization...")
+    # --- Load TEST Baked Data (includes history) ---
+    test_baked_path = processed_data_dir / config.TEST_DATA_FILENAME
+    if not test_baked_path.exists():
+         raise FileNotFoundError(f"Required test data file not found at {test_baked_path}. Please ensure the preprocessing script ran successfully and saved the file.")
 
-    print(f"Loading FULL baked data from: {full_baked_path} (This might take time/memory)")
+    print(f"Loading TEST baked data from: {test_baked_path}")
     try:
-        latest_baked_df = pd.read_parquet(full_baked_path)
+        test_data_df = pd.read_parquet(test_baked_path) # Renamed variable
     except Exception as e:
-        print(f"Error loading Parquet file {full_baked_path}: {e}")
+        print(f"Error loading Parquet file {test_baked_path}: {e}")
         raise
-    print(f"Loaded FULL baked data: {latest_baked_df.shape}")
+    print(f"Loaded TEST baked data (including history): {test_data_df.shape}")
+    if test_data_df.empty:
+        raise ValueError("Test data file is empty. Cannot initialize forecast.")
     # --- End Load Baked Data ---
 
     # Ensure original identifier columns are present
     original_id_cols = metadata.get('original_identifier_columns', [])
-    missing_orig_cols = [col for col in original_id_cols if col not in latest_baked_df.columns]
+    missing_orig_cols = [col for col in original_id_cols if col not in test_data_df.columns]
     if missing_orig_cols:
         raise ValueError(f"Baked data is missing required original identifier columns: {missing_orig_cols}")
     print(f"Found original identifier columns in baked data: {original_id_cols}")
 
     # Calculate period
-    latest_baked_df[config.DATE_COL] = pd.to_datetime(latest_baked_df[config.DATE_COL])
-    latest_baked_df['period'] = latest_baked_df[config.DATE_COL].dt.year * 100 + latest_baked_df[config.DATE_COL].dt.month
+    test_data_df[config.DATE_COL] = pd.to_datetime(test_data_df[config.DATE_COL])
+    test_data_df['period'] = test_data_df[config.DATE_COL].dt.year * 100 + test_data_df[config.DATE_COL].dt.month
 
-    # Determine the start period for the simulation
-    available_periods = sorted(latest_baked_df['period'].unique())
+    # Determine the actual start date of the test observations from metadata
+    test_start_dt_str = metadata.get('train_end_date_preprocess')
+    if not test_start_dt_str:
+        raise ValueError("Metadata missing 'train_end_date_preprocess', cannot determine test start date.")
+    test_start_dt = pd.to_datetime(test_start_dt_str) + pd.Timedelta(days=1)
+    actual_test_start_period = test_start_dt.year * 100 + test_start_dt.month
+
+    # Filter available periods to only include those >= actual_test_start_period
+    available_periods = sorted([p for p in test_data_df['period'].unique() if p >= actual_test_start_period])
     if not available_periods:
-        raise ValueError("No periods found in the loaded baked data.")
+        raise ValueError(f"No periods found in the loaded test data on or after the expected test start period {actual_test_start_period}.")
 
+    # Determine the simulation start period
     if start_year and start_month:
         start_period = start_year * 100 + start_month
         if start_period not in available_periods:
-             raise ValueError(f"Specified start period {start_period} ({start_year}-{start_month:02d}) not found in the baked data. Available periods range from {min(available_periods)} to {max(available_periods)}.")
-        print(f"Using specified start period: {start_period}")
+             raise ValueError(f"Specified start period {start_period} ({start_year}-{start_month:02d}) not found in the test data's forecast range. Available periods range from {min(available_periods)} to {max(available_periods)}.")
+        print(f"Using specified start period from test data: {start_period}")
     else:
-        start_period = available_periods[-1] # Use the latest period
+        start_period = available_periods[0] # Use the EARLIEST period in the test set's forecast range
         start_date = period_to_date(start_period)
-        print(f"Using latest period in baked data as start period: {start_period} ({start_date.strftime('%Y-%m') if start_date else 'Invalid Date'})")
+        print(f"Using earliest period in test data's forecast range as start period: {start_period} ({start_date.strftime('%Y-%m') if start_date else 'Invalid Date'})")
 
-
-    # Get individuals present in the start period
-    start_period_ids = latest_baked_df[latest_baked_df['period'] == start_period][config.GROUP_ID_COL].unique() # Use config
+    # Get individuals present in the simulation start period
+    start_period_ids = test_data_df[test_data_df['period'] == start_period][config.GROUP_ID_COL].unique()
     if len(start_period_ids) == 0:
-        raise ValueError(f"No individuals found in the specified start period {start_period}. Check data integrity or start period selection.")
+        raise ValueError(f"No individuals found in the specified start period {start_period} within the test data.")
     print(f"Found {len(start_period_ids)} unique individuals present in the start period ({start_period}).")
 
-    # Filter the baked data to include only the history *up to* the start period for these individuals
-    # This is the crucial step for initial simulation state
-    initial_sim_data = latest_baked_df[
-        (latest_baked_df[config.GROUP_ID_COL].isin(start_period_ids)) &
-        (latest_baked_df['period'] <= start_period)
-    ].sort_values([config.GROUP_ID_COL, config.DATE_COL]) # Sort is important for sequence extraction
+    # Filter the loaded test_data_df to include history *up to* the start period for these individuals
+    initial_sim_data = test_data_df[
+        (test_data_df[config.GROUP_ID_COL].isin(start_period_ids)) &
+        (test_data_df['period'] <= start_period)
+    ].sort_values([config.GROUP_ID_COL, config.DATE_COL]) # Sort is important
 
-    # --- Delete the large full dataframe ASAP ---
-    del latest_baked_df
+    # --- Delete the loaded dataframe if no longer needed (initial_sim_data is a slice/copy) ---
+    del test_data_df
     gc.collect()
-    print("Released memory from the full baked dataframe.")
+    print("Released memory from the loaded test dataframe.")
     # ---
 
-    # --- Historical Rates are loaded separately now ---
-    # Remove loading of raw data and calculation of historical_rates_df here
-
-    # Return only the initial simulation data and start period info
+    # Return the filtered data containing history + start period state
     return initial_sim_data, start_period, start_period_ids
 
 def get_sequences_for_simulation(sim_data_df: pd.DataFrame, group_col: str, seq_len: int, features: list, original_id_cols: list, pad_val: float, end_period: int):

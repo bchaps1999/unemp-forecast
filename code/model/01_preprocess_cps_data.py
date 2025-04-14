@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 import os
 import sys
+import gc # Import garbage collector
 
 # Import scikit-learn components
 from sklearn.model_selection import train_test_split
@@ -27,21 +28,20 @@ except ImportError:
 # --- Parameters & Configuration ---
 
 def preprocess_data():
-    """Main function to load, clean, preprocess all, save all, sample, split, and save splits."""
+    """Main function to load, clean, preprocess, split, and save data."""
     # --- Setup Paths ---
     project_root_path = config.PROJECT_ROOT
     input_data_path = config.PREPROCESS_INPUT_FILE
     output_dir_path = config.PREPROCESS_OUTPUT_DIR
     output_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Output files for sampled splits (used by training)
-    train_file = output_dir_path / config.TRAIN_DATA_FILENAME
-    val_file = output_dir_path / config.VAL_DATA_FILENAME
+    # Output files for different splits
+    hpt_train_file = output_dir_path / config.HPT_TRAIN_DATA_FILENAME
+    hpt_val_file = output_dir_path / config.HPT_VAL_DATA_FILENAME
+    full_train_file = output_dir_path / config.FULL_TRAIN_DATA_FILENAME
+    full_val_file = output_dir_path / config.FULL_VAL_DATA_FILENAME
     test_file = output_dir_path / config.TEST_DATA_FILENAME
-    # Output file for HPT validation data
-    hpt_val_file = output_dir_path / config.HPT_VAL_DATA_FILENAME # New path for HPT val data
-    # Output file for ALL processed data (potentially used by forecasting)
-    full_baked_file = output_dir_path / config.FULL_DATA_FILENAME # New path
+    hpt_interval_data_file = output_dir_path / config.HPT_INTERVAL_DATA_FILENAME # Data for HPT objective metric
     # Other outputs
     preprocessor_file = output_dir_path / config.RECIPE_FILENAME
     metadata_file = output_dir_path / config.METADATA_FILENAME
@@ -63,6 +63,8 @@ def preprocess_data():
         return
 
     df = cps_df_raw.copy()
+    del cps_df_raw # Free memory
+    gc.collect()
 
     try:
         df['cpsidp'] = df['cpsidp'].astype(str)
@@ -78,8 +80,9 @@ def preprocess_data():
             df = df[df['date'] <= end_dt]
             print(f"Filtered data before overall end date ({config.PREPROCESS_END_DATE}): {df.shape}")
 
-        # --- Time-based Split for HPT Validation ---
-        print("\nSplitting data based on HPT validation intervals...")
+        # --- Time-based Split Information (Dates Only) ---
+        # Get HPT interval dates and train_end_date_preprocess for later use
+        print("\nProcessing time-based split parameters...")
         if not hasattr(config, 'HPT_VALIDATION_INTERVALS') or not config.HPT_VALIDATION_INTERVALS:
             print("ERROR: config.HPT_VALIDATION_INTERVALS is not defined or empty. Cannot perform time-based split.")
             sys.exit(1)
@@ -87,6 +90,7 @@ def preprocess_data():
         # Convert interval strings to datetime and find the earliest start date
         hpt_intervals = []
         earliest_hpt_start_dt = None
+        latest_hpt_end_dt = None # Track latest end date
         try:
             for start_str, end_str in config.HPT_VALIDATION_INTERVALS:
                 start_dt = pd.to_datetime(start_str)
@@ -96,76 +100,25 @@ def preprocess_data():
                 hpt_intervals.append((start_dt, end_dt))
                 if earliest_hpt_start_dt is None or start_dt < earliest_hpt_start_dt:
                     earliest_hpt_start_dt = start_dt
+                if latest_hpt_end_dt is None or end_dt > latest_hpt_end_dt:
+                    latest_hpt_end_dt = end_dt
             print(f"Using HPT validation intervals: {[(s.date(), e.date()) for s, e in hpt_intervals]}")
+            print(f"Earliest HPT interval start date: {earliest_hpt_start_dt.date()}")
         except Exception as e:
             print(f"ERROR processing HPT_VALIDATION_INTERVALS: {e}")
             sys.exit(1)
 
-        # For HPT validation, we need:
-        # 1. All data within the intervals
-        # 2. Historical data for individuals who appear in those intervals (for sequencing)
-        
-        # First, identify all observations within the HPT intervals
-        hpt_masks = []
-        for start_dt, end_dt in hpt_intervals:
-            hpt_masks.append((df['date'] >= start_dt) & (df['date'] <= end_dt))
-        combined_hpt_mask = pd.concat(hpt_masks, axis=1).any(axis=1)
-        
-        # Get all individuals who appear in any HPT validation interval
-        individuals_in_hpt = df.loc[combined_hpt_mask, 'cpsidp'].unique()
-        print(f"Found {len(individuals_in_hpt)} unique individuals in HPT validation intervals")
-        
-        # Calculate lookback period (use sequence length from config if available, otherwise default to 24)
-        lookback_months = getattr(config, 'SEQUENCE_LENGTH', 24)
-        
-        # For each interval, include data within the interval PLUS lookback data for relevant individuals
-        hpt_extended_masks = []
-        for start_dt, end_dt in hpt_intervals:
-            # Calculate lookback start date
-            lookback_start_dt = start_dt - pd.DateOffset(months=lookback_months)
-            
-            # Create mask for observations within interval
-            interval_mask = (df['date'] >= start_dt) & (df['date'] <= end_dt)
-            
-            # Find individuals in this specific interval
-            individuals_this_interval = df.loc[interval_mask, 'cpsidp'].unique()
-            
-            # Create mask for lookback data (only for individuals in this interval)
-            lookback_mask = (
-                (df['date'] >= lookback_start_dt) & 
-                (df['date'] < start_dt) & 
-                (df['cpsidp'].isin(individuals_this_interval))
-            )
-            
-            # Combine interval and its lookback data
-            extended_interval_mask = interval_mask | lookback_mask
-            hpt_extended_masks.append(extended_interval_mask)
-        
-        # Combine all extended interval masks
-        combined_extended_mask = pd.concat(hpt_extended_masks, axis=1).any(axis=1)
-        
-        # Get all HPT validation data including lookback periods
-        hpt_val_data_raw = df[combined_extended_mask].copy()
-        
-        # Data for fitting/standard splits is all data NOT in the HPT validation intervals (including lookback)
-        data_for_fitting_raw = df[~combined_extended_mask].copy()
-        
-        print(f"Data for fitting/standard splits (excluding HPT intervals & lookback): {data_for_fitting_raw.shape}")
-        print(f"Data for HPT validation (intervals + lookback): {hpt_val_data_raw.shape}")
-        print(f"  - Including lookback of {lookback_months} months before each interval")
+        # Check TRAIN_END_DATE_PREPROCESS relative to HPT intervals
+        train_end_dt_preprocess = None
+        if config.TRAIN_END_DATE_PREPROCESS:
+             train_end_dt_preprocess = pd.to_datetime(config.TRAIN_END_DATE_PREPROCESS)
+             print(f"Using TRAIN_END_DATE_PREPROCESS: {train_end_dt_preprocess.date()} to separate test data.")
+             if latest_hpt_end_dt and train_end_dt_preprocess <= latest_hpt_end_dt:
+                  print(f"Warning: TRAIN_END_DATE_PREPROCESS ({train_end_dt_preprocess.date()}) is on or before the latest HPT interval end date ({latest_hpt_end_dt.date()}). This might lead to unexpected test set composition.")
+        else:
+             print("Warning: TRAIN_END_DATE_PREPROCESS not set in config. Test set will be empty.")
 
-        # Verify the two datasets include all observations and have no overlap
-        total_raw_rows = len(data_for_fitting_raw) + len(hpt_val_data_raw)
-        expected_total = len(df)
-        if total_raw_rows != expected_total:
-            print(f"WARNING: Unexpected count mismatch. Combined splits ({total_raw_rows}) vs original data ({expected_total})")
-
-        # --- Continue Cleaning and Feature Engineering (on both splits if needed, or apply functions) ---
-        # Apply cleaning/feature engineering steps consistently.
-        # It's often easier to do this on the combined dataframe 'df' before splitting,
-        # but ensure features like 'months_since_last' are calculated correctly after sorting.
-        # Let's re-apply the cleaning steps to the split dataframes to be safe.
-
+        # --- Apply Cleaning and Feature Engineering to Entire DataFrame ---
         def apply_cleaning(input_df):
             """
             Applies minimal cleaning/type conversion assuming input CSV is pre-cleaned by R script.
@@ -289,20 +242,17 @@ def preprocess_data():
 
             return temp_df, target_map, target_map_inverse # Return both maps
 
-        print("Applying cleaning steps to 'data_for_fitting_raw'...")
-        # Pass target_map explicitly if needed elsewhere, otherwise just get df and inverse map
-        data_for_fitting_clean, target_map, target_map_inverse = apply_cleaning(data_for_fitting_raw)
-        # target_map_inverse = {v: k for k, v in target_map.items()} # Get inverse map - now returned by function
-
-        print("Applying cleaning steps to 'hpt_val_data_raw'...")
-        # Don't need maps from this, just the cleaned df
-        hpt_val_data_clean, _, _ = apply_cleaning(hpt_val_data_raw)
+        print("Applying cleaning steps to the entire dataframe...")
+        df_clean, target_map, target_map_inverse = apply_cleaning(df)
+        print(f"Data shape after cleaning: {df_clean.shape}")
+        del df # Free memory
+        gc.collect()
 
     except Exception as e:
-        print(f"ERROR during data cleaning or time splitting: {e}")
+        print(f"ERROR during data cleaning: {e}")
         raise
 
-    # --- 2. Define Columns & Create Final DF ---
+    # --- 2. Define Columns ---
     print("\n===== STEP 2: Defining Columns =====")
     # Update predictor_cols list to use the variable names expected from the R script's output
     # These should align with the columns processed/checked in the simplified apply_cleaning
@@ -331,83 +281,45 @@ def preprocess_data():
     # Base ID columns needed
     base_id_cols = ['cpsidp', 'date', 'target_state', 'wtfinl'] # target_state created in Python
 
-    # Ensure all required columns (predictors, base IDs, original IDs) exist after cleaning
+    # Ensure all required columns exist after cleaning
     all_needed_cols = list(dict.fromkeys(base_id_cols + predictor_cols + original_id_cols))
-    missing_cols_fit = [col for col in all_needed_cols if col not in data_for_fitting_clean.columns]
-    missing_cols_hpt = [col for col in all_needed_cols if col not in hpt_val_data_clean.columns and not hpt_val_data_clean.empty]
+    missing_cols = [col for col in all_needed_cols if col not in df_clean.columns]
+    if missing_cols:
+         raise ValueError(f"Missing required columns in cleaned data: {missing_cols}")
 
-    if missing_cols_fit:
-         raise ValueError(f"Missing required columns in fitting data after cleaning: {missing_cols_fit}")
-    if missing_cols_hpt:
-         raise ValueError(f"Missing required columns in HPT validation data after cleaning: {missing_cols_hpt}")
-
-
-    # Columns to keep before processing (already filtered by all_needed_cols check)
-    keep_cols = all_needed_cols
-
-    # Select columns for both dataframes - use the validated list
-    df_final_fit = data_for_fitting_clean[keep_cols].copy()
-    df_final_hpt = hpt_val_data_clean[keep_cols].copy() if not hpt_val_data_clean.empty else pd.DataFrame(columns=keep_cols)
-
-    print(f"Data shape for fitting before preprocessing: {df_final_fit.shape}")
-    print(f"Data shape for HPT validation before preprocessing: {df_final_hpt.shape}")
     print(f"Predictor columns for pipeline: {predictor_cols}")
     print(f"Original ID columns kept: {original_id_cols}")
 
-    # --- 3. Handle Sparse Categories (on fitting data only) ---
-    print("\n===== STEP 3: Grouping Sparse Categorical Features (on Fitting Data) =====")
-    potential_categorical_features = df_final_fit[predictor_cols].select_dtypes(include=['category', 'object']).columns.tolist()
+    # --- 3. Handle Sparse Categories (on entire cleaned data) ---
+    print("\n===== STEP 3: Grouping Sparse Categorical Features (on Entire Cleaned Data) =====")
+    potential_categorical_features = df_clean[predictor_cols].select_dtypes(include=['category', 'object']).columns.tolist()
     print(f"Identified potential categorical features for sparsity check: {potential_categorical_features}")
     sparsity_threshold = getattr(config, 'SPARSITY_THRESHOLD', 0.01)
     print(f"Using sparsity threshold: {sparsity_threshold}")
 
-    sparse_categories_map = {} # Store sparse categories found in fitting data
-    if sparsity_threshold > 0 and not df_final_fit.empty:
+    if sparsity_threshold > 0 and not df_clean.empty:
         for col in potential_categorical_features:
-            frequencies = df_final_fit[col].value_counts(normalize=True)
+            frequencies = df_clean[col].value_counts(normalize=True)
             sparse_cats = frequencies[frequencies < sparsity_threshold].index.tolist()
             if sparse_cats:
                 print(f"  Grouping sparse categories in '{col}': {sparse_cats}")
                 other_category = "_OTHER_"
-                sparse_categories_map[col] = sparse_cats # Store for applying to HPT data
-
-                # Apply to fitting data
-                if pd.api.types.is_categorical_dtype(df_final_fit[col]):
-                    if other_category not in df_final_fit[col].cat.categories:
-                        df_final_fit[col] = df_final_fit[col].cat.add_categories([other_category])
-                    df_final_fit[col] = df_final_fit[col].replace(sparse_cats, other_category)
-                else: # Should be categorical, but handle object type just in case
-                    df_final_fit[col] = df_final_fit[col].replace(sparse_cats, other_category)
-                    # Convert back to categorical if needed, ensuring _OTHER_ is included
-                    all_cats = df_final_fit[col].unique().tolist()
-                    df_final_fit[col] = pd.Categorical(df_final_fit[col], categories=all_cats)
-
-        # Apply the same grouping to HPT validation data
-        print("Applying sparse category grouping to HPT validation data...")
-        if not df_final_hpt.empty:
-            for col, sparse_cats in sparse_categories_map.items():
-                if col in df_final_hpt.columns:
-                    other_category = "_OTHER_"
-                    # Ensure the category exists before replacing
-                    if pd.api.types.is_categorical_dtype(df_final_hpt[col]):
-                         if other_category not in df_final_hpt[col].cat.categories:
-                              df_final_hpt[col] = df_final_hpt[col].cat.add_categories([other_category])
-                         # Replace only categories that exist in this split's column
-                         cats_to_replace = [cat for cat in sparse_cats if cat in df_final_hpt[col].cat.categories]
-                         if cats_to_replace:
-                              df_final_hpt[col] = df_final_hpt[col].replace(cats_to_replace, other_category)
-                    else: # Object type
-                         df_final_hpt[col] = df_final_hpt[col].replace(sparse_cats, other_category)
-                         all_cats_hpt = df_final_hpt[col].unique().tolist()
-                         df_final_hpt[col] = pd.Categorical(df_final_hpt[col], categories=all_cats_hpt)
-
+                # Apply grouping directly to df_clean
+                if pd.api.types.is_categorical_dtype(df_clean[col]):
+                    if other_category not in df_clean[col].cat.categories:
+                        df_clean[col] = df_clean[col].cat.add_categories([other_category])
+                    df_clean[col] = df_clean[col].replace(sparse_cats, other_category)
+                else: # Object type
+                    df_clean[col] = df_clean[col].replace(sparse_cats, other_category)
+                    all_cats = df_clean[col].unique().tolist()
+                    df_clean[col] = pd.Categorical(df_clean[col], categories=all_cats)
     else:
-        print("Skipping sparse category grouping.")
+        print("Sparsity threshold is 0 or data is empty, skipping grouping.")
 
-    # --- 4. Define and Fit Preprocessing Pipeline (on fitting data only) ---
-    print("\n===== STEP 4: Defining and Fitting Preprocessing Pipeline (on Fitting Data) =====")
-    numeric_features = df_final_fit[predictor_cols].select_dtypes(include=np.number).columns.tolist()
-    categorical_features = df_final_fit[predictor_cols].select_dtypes(include=['category', 'object']).columns.tolist()
+    # --- 4. Define and Fit Preprocessing Pipeline (on entire cleaned data) ---
+    print("\n===== STEP 4: Defining and Fitting Preprocessing Pipeline (on Entire Cleaned Data) =====")
+    numeric_features = df_clean[predictor_cols].select_dtypes(include=np.number).columns.tolist()
+    categorical_features = df_clean[predictor_cols].select_dtypes(include=['category', 'object']).columns.tolist()
     print(f"Numeric features: {numeric_features}")
     print(f"Categorical features: {categorical_features}")
 
@@ -417,13 +329,13 @@ def preprocess_data():
     preprocessor = ColumnTransformer(transformers=[('num', numeric_transformer, numeric_features), ('cat', categorical_transformer, categorical_features)], remainder='drop')
     full_pipeline = Pipeline(steps=[('preprocess', preprocessor), ('variance_threshold', VarianceThreshold(threshold=0))])
 
-    # Fit the pipeline ONLY on the fitting data's predictor columns
-    print("Fitting pipeline on data before HPT validation period...")
+    # Fit the pipeline ONLY on the predictor columns of the entire cleaned data
+    print("Fitting pipeline on all cleaned data...")
     try:
-        # Ensure target_state exists and is not all NaN before fitting
-        if 'target_state' not in df_final_fit.columns or df_final_fit['target_state'].isnull().all():
-             raise ValueError("Target state column is missing or all NaN in the fitting data.")
-        full_pipeline.fit(df_final_fit[predictor_cols], df_final_fit['target_state'])
+        if 'target_state' not in df_clean.columns or df_clean['target_state'].isnull().all():
+             raise ValueError("Target state column is missing or all NaN in the cleaned data.")
+        # Use predictor columns and target from df_clean
+        full_pipeline.fit(df_clean[predictor_cols], df_clean['target_state'])
     except Exception as e:
         print(f"ERROR fitting pipeline: {e}")
         raise
@@ -435,22 +347,16 @@ def preprocess_data():
         print(f"Preprocessing pipeline saved to: {preprocessor_file}")
     except Exception as e: print(f"ERROR saving preprocessor: {e}")
 
-    # --- 5. Apply Pipeline to Both Splits ---
-    print("\n===== STEP 5: Applying Pipeline to Fitting Data and HPT Validation Data =====")
-    print("Applying pipeline to fitting data...")
-    X_fit_baked_np = full_pipeline.transform(df_final_fit[predictor_cols])
+    # --- 5. Apply Pipeline to Create Full Baked DataFrame ---
+    print("\n===== STEP 5: Applying Pipeline to Create Full Baked DataFrame =====")
+    print("Applying pipeline to all cleaned data...")
+    try:
+        X_baked_np = full_pipeline.transform(df_clean[predictor_cols])
+    except Exception as e:
+        print(f"ERROR applying pipeline: {e}")
+        raise
 
-    print("Applying pipeline to HPT validation data...")
-    X_hpt_baked_np = np.array([]).reshape(0, X_fit_baked_np.shape[1]) # Initialize empty with correct columns
-    if not df_final_hpt.empty:
-        try:
-            X_hpt_baked_np = full_pipeline.transform(df_final_hpt[predictor_cols])
-        except Exception as e:
-            print(f"ERROR applying pipeline to HPT validation data: {e}")
-            # Decide how to handle: stop, or continue with empty HPT set? Let's stop.
-            raise
-
-    # Get feature names after transformation (from the fitted pipeline)
+    # Get feature names after transformation
     try:
         col_transformer = full_pipeline.named_steps['preprocess']
         final_feature_names = col_transformer.get_feature_names_out()
@@ -460,136 +366,285 @@ def preprocess_data():
         print(f"Number of features after preprocessing: {len(final_feature_names_after_vt)}")
     except Exception as e:
         print(f"Warning: Could not retrieve feature names from pipeline: {e}")
-        final_feature_names_after_vt = [f"feature_{i}" for i in range(X_fit_baked_np.shape[1])]
+        final_feature_names_after_vt = [f"feature_{i}" for i in range(X_baked_np.shape[1])]
 
-    # Create the baked DataFrames
-    fit_baked_df = pd.DataFrame(X_fit_baked_np, columns=final_feature_names_after_vt, index=df_final_fit.index)
-    hpt_baked_df = pd.DataFrame(X_hpt_baked_np, columns=final_feature_names_after_vt, index=df_final_hpt.index) if not df_final_hpt.empty else pd.DataFrame(columns=final_feature_names_after_vt)
+    # Create the single, fully baked DataFrame
+    full_baked_df = pd.DataFrame(X_baked_np, columns=final_feature_names_after_vt, index=df_clean.index)
 
-    # Add back base IDs and original IDs
-    id_cols_to_add = base_id_cols + original_id_cols
-    fit_baked_df = pd.concat([df_final_fit[id_cols_to_add], fit_baked_df], axis=1)
-    if not df_final_hpt.empty:
-        hpt_baked_df = pd.concat([df_final_hpt[id_cols_to_add], hpt_baked_df], axis=1)
+    # Add back base IDs and original IDs from df_clean
+    id_cols_to_add = list(dict.fromkeys(base_id_cols + original_id_cols)) # Ensure unique
+    full_baked_df = pd.concat([df_clean[id_cols_to_add], full_baked_df], axis=1)
 
-    print(f"Fitting data baked shape: {fit_baked_df.shape}")
-    print(f"HPT validation data baked shape: {hpt_baked_df.shape}")
-
-    # --- Combine for Full Baked Data ---
-    print("\nCombining fitting and HPT validation data for the full baked dataset...")
-    full_baked_df = pd.concat([fit_baked_df, hpt_baked_df], ignore_index=True)
     print(f"Full baked data shape: {full_baked_df.shape}")
 
-    # --- Save Full Baked Data ---
-    print(f"\nSaving full baked data to {full_baked_file}...")
-    try:
-        full_baked_df.to_parquet(full_baked_file, index=False)
-        print(f"Full baked data saved successfully.")
-    except Exception as e:
-        print(f"ERROR saving full baked data: {e}")
-        # Decide if this error should stop the process
-        # return
+    # Clean up intermediate data
+    del df_clean, X_baked_np
+    gc.collect()
 
-    # --- 6. Save HPT Validation Baked Data --- # Step number adjusted due to insertion
-    print("\n===== STEP 6: Saving HPT Validation Baked Data =====")
-    if not hpt_baked_df.empty:
-        try:
-            hpt_baked_df.to_parquet(hpt_val_file, index=False)
-            print(f"HPT validation baked data saved to: {hpt_val_file}")
-        except Exception as e:
-            print(f"ERROR saving HPT validation baked data: {e}")
-    else:
-        print("HPT validation data is empty, not saving file.")
+    # --- 6. Time-Based Splitting of full_baked_df ---
+    print("\n===== STEP 6: Splitting Baked Data Based on Time =====")
+    hpt_interval_data_baked = pd.DataFrame(columns=full_baked_df.columns)
+    test_data_baked = pd.DataFrame(columns=full_baked_df.columns)
+    train_val_pool_baked = pd.DataFrame(columns=full_baked_df.columns)
 
-    # --- 7. Sample Individuals (from fitting data only) --- # Step number adjusted
-    print("\n===== STEP 7: Sampling Individuals for Training Splits (from Fitting Data) =====")
-    all_person_ids_fit = fit_baked_df['cpsidp'].unique()
-    n_all_persons_fit = len(all_person_ids_fit)
-    sampled_ids = all_person_ids_fit # Default to all IDs from the fitting period
+    # Ensure date column is datetime
+    full_baked_df['date'] = pd.to_datetime(full_baked_df['date'])
 
-    if config.PREPROCESS_NUM_INDIVIDUALS is not None and config.PREPROCESS_NUM_INDIVIDUALS > 0:
-        if config.PREPROCESS_NUM_INDIVIDUALS >= n_all_persons_fit:
-            print(f"Requested {config.PREPROCESS_NUM_INDIVIDUALS} individuals, have {n_all_persons_fit} in fitting period. Using all available.")
+    # --- Extract HPT Interval Data (including lookback) ---
+    print("Extracting HPT interval data...")
+    hpt_extended_masks_baked = []
+    lookback_months = getattr(config, 'SEQUENCE_LENGTH', 24) # Use sequence length for lookback
+    for start_dt, end_dt in hpt_intervals:
+        # Define the actual interval period
+        interval_mask = (full_baked_df['date'] >= start_dt) & (full_baked_df['date'] <= end_dt)
+        # Find individuals present *within* this interval
+        individuals_this_interval = full_baked_df.loc[interval_mask, 'cpsidp'].unique()
+        # Define the lookback period for these individuals
+        lookback_start_dt = start_dt - pd.DateOffset(months=lookback_months)
+        lookback_mask = (
+            (full_baked_df['date'] >= lookback_start_dt) &
+            (full_baked_df['date'] < start_dt) &
+            (full_baked_df['cpsidp'].isin(individuals_this_interval))
+        )
+        # Combine interval observations and their lookback
+        extended_interval_mask = interval_mask | lookback_mask
+        hpt_extended_masks_baked.append(extended_interval_mask)
+
+    # Combine masks for all HPT intervals
+    combined_hpt_interval_mask_baked = pd.concat(hpt_extended_masks_baked, axis=1).any(axis=1) if hpt_extended_masks_baked else pd.Series([False]*len(full_baked_df), index=full_baked_df.index)
+    hpt_interval_data_baked = full_baked_df[combined_hpt_interval_mask_baked].copy()
+    print(f"HPT interval data baked shape (including lookback): {hpt_interval_data_baked.shape}") # Clarified shape description
+
+    # --- Extract Test Data (including lookback) ---
+    print("Extracting Test data...")
+    test_set_indices = pd.Index([]) # Initialize empty index for test set rows
+    if train_end_dt_preprocess:
+        test_start_dt = train_end_dt_preprocess + pd.Timedelta(days=1)
+        print(f"Test period starts on/after: {test_start_dt.date()}")
+
+        # Identify ALL individuals with ANY observation within the test period
+        test_period_observations_mask = (full_baked_df['date'] >= test_start_dt)
+        test_period_individuals = full_baked_df.loc[test_period_observations_mask, 'cpsidp'].unique()
+        print(f"Found {len(test_period_individuals)} unique individuals with observations on/after {test_start_dt.date()}.")
+
+        if len(test_period_individuals) > 0:
+            # Re-select the actual test observations for these specific individuals
+            test_observations_mask_final = (full_baked_df['cpsidp'].isin(test_period_individuals)) & \
+                                           (full_baked_df['date'] >= test_start_dt)
+            test_observations = full_baked_df[test_observations_mask_final]
+
+            # Extract lookback history for these individuals from full_baked_df
+            lookback_months_test = getattr(config, 'SEQUENCE_LENGTH', 24) # Use sequence length for lookback
+            lookback_start_dt_test = test_start_dt - pd.DateOffset(months=lookback_months_test)
+
+            lookback_history_mask = (full_baked_df['cpsidp'].isin(test_period_individuals)) & \
+                                    (full_baked_df['date'] < test_start_dt) & \
+                                    (full_baked_df['date'] >= lookback_start_dt_test) # Ensure lookback doesn't go too far back
+            lookback_history = full_baked_df[lookback_history_mask]
+
+            # Combine lookback and actual test observations
+            test_data_baked = pd.concat([lookback_history, test_observations], ignore_index=True).sort_values(['cpsidp', 'date'])
+            print(f"Test data baked shape (including lookback): {test_data_baked.shape}")
+
+            # Identify rows belonging to the test set (observations + lookback) in the original index
+            test_set_indices = full_baked_df.index[test_observations_mask_final | lookback_history_mask]
         else:
-            print(f"Sampling {config.PREPROCESS_NUM_INDIVIDUALS} individuals from {n_all_persons_fit} available in fitting period...")
-            sampled_ids = np.random.choice(all_person_ids_fit, config.PREPROCESS_NUM_INDIVIDUALS, replace=False)
-            print(f"Selected {len(sampled_ids)} individuals for training/val/test splits.")
+            print("No individuals found in the test period. Test set is empty.")
+            # test_set_indices remains empty
     else:
-        print("PREPROCESS_NUM_INDIVIDUALS not set or <= 0. Using all individuals from fitting period for splits.")
+        print("TRAIN_END_DATE_PREPROCESS not set. Test set is empty.")
+        # test_set_indices remains empty
 
-    n_sampled_persons = len(sampled_ids)
+    # --- Create Train/Val Pool ---
+    print("Creating Train/Val pool...")
+    # Exclude HPT interval rows and Test set rows (including lookback)
+    hpt_interval_indices = full_baked_df.index[combined_hpt_interval_mask_baked]
+    # Ensure test_set_indices is valid before union
+    exclude_indices = hpt_interval_indices.union(test_set_indices if not test_set_indices.empty else pd.Index([]))
+    train_val_pool_baked = full_baked_df.drop(exclude_indices).copy()
+    print(f"Train/Val pool baked shape: {train_val_pool_baked.shape}")
 
-    # --- 8. Split Sampled IDs into Train/Val/Test ---
-    print("\n===== STEP 8: Splitting Sampled Individual IDs =====")
-    if n_sampled_persons == 0:
-        print("ERROR: No individuals available from fitting data after potential sampling. Cannot create splits.")
-        return
+    # Verification (Optional but recommended)
+    # Check for overlap (should be empty)
+    pool_excluded_overlap = train_val_pool_baked.index.intersection(exclude_indices)
+    if not pool_excluded_overlap.empty:
+         print(f"WARNING: Overlap detected between train/val pool and excluded indices! Count: {len(pool_excluded_overlap)}")
+    # Check row counts (sum may not perfectly match due to overlapping lookback periods)
+    print(f"Row counts - HPT Interval: {len(hpt_interval_data_baked)}, Test: {len(test_data_baked)}, Train/Val Pool: {len(train_val_pool_baked)}")
+    print(f"Total rows in full_baked_df before splitting: {len(full_baked_df.index)}") # Use original index count
 
-    train_size = int(config.TRAIN_SPLIT * n_sampled_persons)
-    val_size = int(config.VAL_SPLIT * n_sampled_persons)
-    test_size = n_sampled_persons - train_size - val_size
+    # Clean up full_baked_df
+    del full_baked_df
+    gc.collect()
 
-    if test_size < 0:
-        print("Warning: Train + Validation split > 1.0. Adjusting validation size.")
-        val_size = n_sampled_persons - train_size
-        test_size = 0
+    # --- 7. Create FULL Train/Validation Splits ---
+    print("\n===== STEP 7: Creating FULL Train/Validation Splits =====")
+    all_person_ids_full_pool = train_val_pool_baked['cpsidp'].unique()
+    n_all_persons_full_pool = len(all_person_ids_full_pool)
+    sampled_ids_full = all_person_ids_full_pool # Default to all
 
-    # Split the sampled IDs
-    train_ids, remaining_ids = train_test_split(sampled_ids, train_size=train_size, random_state=config.RANDOM_SEED)
-    val_ids, test_ids = np.array([]), np.array([]) # Initialize
-    if len(remaining_ids) > 0 and (val_size + test_size) > 0 :
-         val_prop_remaining = val_size / (val_size + test_size) if (val_size + test_size) > 0 else 0
-         if val_prop_remaining > 0 and val_prop_remaining < 1:
-             val_ids, test_ids = train_test_split(remaining_ids, train_size=val_prop_remaining, random_state=config.RANDOM_SEED)
-         elif val_prop_remaining >= 1: val_ids = remaining_ids
-         else: test_ids = remaining_ids
+    if config.PREPROCESS_NUM_INDIVIDUALS_FULL is not None and config.PREPROCESS_NUM_INDIVIDUALS_FULL > 0:
+        if config.PREPROCESS_NUM_INDIVIDUALS_FULL >= n_all_persons_full_pool:
+            print(f"Requested {config.PREPROCESS_NUM_INDIVIDUALS_FULL} individuals for FULL splits, have {n_all_persons_full_pool}. Using all.")
+        else:
+            print(f"Sampling {config.PREPROCESS_NUM_INDIVIDUALS_FULL} individuals from {n_all_persons_full_pool} for FULL splits...")
+            sampled_ids_full = np.random.choice(all_person_ids_full_pool, config.PREPROCESS_NUM_INDIVIDUALS_FULL, replace=False)
+            print(f"Selected {len(sampled_ids_full)} individuals.")
+    else:
+        print("PREPROCESS_NUM_INDIVIDUALS_FULL not set or <= 0. Using all individuals from Train/Val Pool for FULL splits.")
 
-    print(f"Sampled Individuals Split - Train: {len(train_ids)}, Validation: {len(val_ids)}, Test: {len(test_ids)}")
+    n_sampled_persons_full = len(sampled_ids_full)
 
-    # --- 9. Filter Baked Fitting Data to Create Splits ---
-    print("\n===== STEP 9: Creating Data Splits from Baked Fitting Data =====")
-    train_data_baked = fit_baked_df[fit_baked_df['cpsidp'].isin(train_ids)].copy()
-    val_data_baked = fit_baked_df[fit_baked_df['cpsidp'].isin(val_ids)].copy() if len(val_ids) > 0 else pd.DataFrame(columns=fit_baked_df.columns)
-    test_data_baked = fit_baked_df[fit_baked_df['cpsidp'].isin(test_ids)].copy() if len(test_ids) > 0 else pd.DataFrame(columns=fit_baked_df.columns)
+    # Split sampled IDs into Train/Val
+    full_train_ids, full_val_ids = np.array([]), np.array([])
+    if n_sampled_persons_full > 0:
+        train_size_full = int(config.TRAIN_SPLIT * n_sampled_persons_full)
+        # Ensure validation set is not empty if test split is 0
+        val_size_full = max(1, int(config.VAL_SPLIT * n_sampled_persons_full)) if (config.TRAIN_SPLIT + config.VAL_SPLIT) < 1 else (n_sampled_persons_full - train_size_full)
+        val_size_full = min(val_size_full, n_sampled_persons_full - train_size_full) # Ensure val_size doesn't exceed remaining
 
-    print(f"Shape of final baked train data (sampled): {train_data_baked.shape}")
-    print(f"Shape of final baked val data (sampled): {val_data_baked.shape}")
-    print(f"Shape of final baked test data (sampled): {test_data_baked.shape}")
+        if train_size_full + val_size_full > n_sampled_persons_full:
+             print(f"Warning: Full Train ({train_size_full}) + Val ({val_size_full}) > Total ({n_sampled_persons_full}). Adjusting Val.")
+             val_size_full = n_sampled_persons_full - train_size_full
 
-    # --- 10. Save Sampled Data Splits ---
-    print("\n===== STEP 10: Saving Sampled Data Splits (Parquet) =====")
+        full_train_ids, full_val_ids = train_test_split(sampled_ids_full, train_size=train_size_full, test_size=val_size_full, random_state=config.RANDOM_SEED)
+        print(f"FULL Individuals Split - Train: {len(full_train_ids)}, Validation: {len(full_val_ids)}")
+    else:
+        print("No individuals available for FULL splits.")
+
+    # Filter data
+    full_train_data_baked = train_val_pool_baked[train_val_pool_baked['cpsidp'].isin(full_train_ids)].copy() if len(full_train_ids) > 0 else pd.DataFrame(columns=train_val_pool_baked.columns)
+    full_val_data_baked = train_val_pool_baked[train_val_pool_baked['cpsidp'].isin(full_val_ids)].copy() if len(full_val_ids) > 0 else pd.DataFrame(columns=train_val_pool_baked.columns)
+
+    print(f"Shape of final FULL train data: {full_train_data_baked.shape}")
+    print(f"Shape of final FULL val data: {full_val_data_baked.shape}")
+
+    # Save FULL splits
+    print("\nSaving FULL Train/Validation Splits...")
     try:
-        train_data_baked.to_parquet(train_file, index=False)
-        val_data_baked.to_parquet(val_file, index=False)
-        test_data_baked.to_parquet(test_file, index=False)
-        print("Sampled baked data splits saved:")
-        print(f" - Train: {train_file}")
-        print(f" - Validation: {val_file}")
-        print(f" - Test: {test_file}")
+        full_train_data_baked.to_parquet(full_train_file, index=False)
+        full_val_data_baked.to_parquet(full_val_file, index=False)
+        print(f" - FULL Train: {full_train_file}")
+        print(f" - FULL Validation: {full_val_file}")
     except Exception as e:
-        print(f"ERROR saving sampled baked data splits: {e}")
+        print(f"ERROR saving FULL baked data splits: {e}")
 
-    # --- 11. Save Metadata ---
-    print("\n===== STEP 11: Saving Metadata =====")
+    # --- 8. Create HPT Train/Validation Splits ---
+    print("\n===== STEP 8: Creating HPT Train/Validation Splits =====")
+    # Use the same pool as the FULL splits (data before TRAIN_END_DATE_PREPROCESS, excluding HPT intervals)
+    # Apply HPT-specific sampling (PREPROCESS_NUM_INDIVIDUALS_HPT) to this pool.
+    hpt_train_val_pool_baked = train_val_pool_baked # Use the full pool defined in Step 7
+    print(f"Pool for HPT splits (data before {train_end_dt_preprocess.date() if train_end_dt_preprocess else 'end of data'}, excluding HPT intervals): {hpt_train_val_pool_baked.shape}") # Updated print statement
+
+    # Use the *same* pool of individuals as the FULL splits pool
+    all_person_ids_hpt_pool = all_person_ids_full_pool # IDs from train_val_pool_baked
+    n_all_persons_hpt_pool = len(all_person_ids_hpt_pool)
+    sampled_ids_hpt = all_person_ids_hpt_pool # Default to all
+
+    if config.PREPROCESS_NUM_INDIVIDUALS_HPT is not None and config.PREPROCESS_NUM_INDIVIDUALS_HPT > 0:
+        if config.PREPROCESS_NUM_INDIVIDUALS_HPT >= n_all_persons_hpt_pool:
+            print(f"Requested {config.PREPROCESS_NUM_INDIVIDUALS_HPT} individuals for HPT splits, have {n_all_persons_hpt_pool}. Using all.")
+        else:
+            print(f"Sampling {config.PREPROCESS_NUM_INDIVIDUALS_HPT} individuals from {n_all_persons_hpt_pool} available in the pool for HPT splits...") # Clarified print
+            sampled_ids_hpt = np.random.choice(all_person_ids_hpt_pool, config.PREPROCESS_NUM_INDIVIDUALS_HPT, replace=False)
+            print(f"Selected {len(sampled_ids_hpt)} individuals.")
+    else:
+        print("PREPROCESS_NUM_INDIVIDUALS_HPT not set or <= 0. Using all individuals from the pool for HPT splits.")
+
+    n_sampled_persons_hpt = len(sampled_ids_hpt)
+
+    # Split sampled IDs into Train/Val
+    hpt_train_ids, hpt_val_ids = np.array([]), np.array([])
+    if n_sampled_persons_hpt > 0:
+        train_size_hpt = int(config.TRAIN_SPLIT * n_sampled_persons_hpt)
+        val_size_hpt = max(1, int(config.VAL_SPLIT * n_sampled_persons_hpt)) if (config.TRAIN_SPLIT + config.VAL_SPLIT) < 1 else (n_sampled_persons_hpt - train_size_hpt)
+        val_size_hpt = min(val_size_hpt, n_sampled_persons_hpt - train_size_hpt)
+
+        if train_size_hpt + val_size_hpt > n_sampled_persons_hpt:
+             print(f"Warning: HPT Train ({train_size_hpt}) + Val ({val_size_hpt}) > Total ({n_sampled_persons_hpt}). Adjusting Val.")
+             val_size_hpt = n_sampled_persons_hpt - train_size_hpt
+
+        hpt_train_ids, hpt_val_ids = train_test_split(sampled_ids_hpt, train_size=train_size_hpt, test_size=val_size_hpt, random_state=config.RANDOM_SEED)
+        print(f"HPT Individuals Split - Train: {len(hpt_train_ids)}, Validation: {len(hpt_val_ids)}")
+    else:
+        print("No individuals available for HPT splits.")
+
+
+    # Filter data from the hpt_train_val_pool_baked (which is = train_val_pool_baked)
+    hpt_train_data_baked = hpt_train_val_pool_baked[hpt_train_val_pool_baked['cpsidp'].isin(hpt_train_ids)].copy() if len(hpt_train_ids) > 0 else pd.DataFrame(columns=hpt_train_val_pool_baked.columns)
+    hpt_val_data_baked = hpt_train_val_pool_baked[hpt_train_val_pool_baked['cpsidp'].isin(hpt_val_ids)].copy() if len(hpt_val_ids) > 0 else pd.DataFrame(columns=hpt_train_val_pool_baked.columns)
+
+    print(f"Shape of final HPT train data: {hpt_train_data_baked.shape}")
+    print(f"Shape of final HPT val data: {hpt_val_data_baked.shape}")
+
+    # Save HPT splits
+    print("\nSaving HPT Train/Validation Splits...")
+    try:
+        hpt_train_data_baked.to_parquet(hpt_train_file, index=False)
+        hpt_val_data_baked.to_parquet(hpt_val_file, index=False)
+        print(f" - HPT Train: {hpt_train_file}")
+        print(f" - HPT Validation: {hpt_val_file}")
+    except Exception as e:
+        print(f"ERROR saving HPT baked data splits: {e}")
+
+    # Clean up pool
+    del train_val_pool_baked
+    gc.collect()
+
+    # --- 9. Save Splits ---
+    print("\n===== STEP 9: Saving Final Data Splits =====")
+    # Save HPT Interval Data
+    if not hpt_interval_data_baked.empty:
+        try:
+            hpt_interval_data_baked.to_parquet(hpt_interval_data_file, index=False)
+            print(f" - HPT Interval Data: {hpt_interval_data_file}")
+        except Exception as e: print(f"ERROR saving HPT interval data: {e}")
+    else: print(" - HPT Interval Data: Empty, not saved.")
+
+    # Save Test Data
+    if not test_data_baked.empty:
+        try:
+            test_data_baked.to_parquet(test_file, index=False)
+            print(f" - Test Data: {test_file}")
+        except Exception as e: print(f"ERROR saving test data: {e}")
+    else: print(" - Test Data: Empty, not saved.")
+
+    # Save FULL Splits
+    try:
+        if not full_train_data_baked.empty:
+            full_train_data_baked.to_parquet(full_train_file, index=False)
+            print(f" - FULL Train: {full_train_file}")
+        else: print(" - FULL Train: Empty, not saved.")
+        if not full_val_data_baked.empty:
+            full_val_data_baked.to_parquet(full_val_file, index=False)
+            print(f" - FULL Validation: {full_val_file}")
+        else: print(" - FULL Validation: Empty, not saved.")
+    except Exception as e: print(f"ERROR saving FULL splits: {e}")
+
+    # Save HPT Splits
+    try:
+        if not hpt_train_data_baked.empty:
+            hpt_train_data_baked.to_parquet(hpt_train_file, index=False)
+            print(f" - HPT Train: {hpt_train_file}")
+        else: print(" - HPT Train: Empty, not saved.")
+        if not hpt_val_data_baked.empty:
+            hpt_val_data_baked.to_parquet(hpt_val_file, index=False)
+            print(f" - HPT Validation: {hpt_val_file}")
+        else: print(" - HPT Validation: Empty, not saved.")
+    except Exception as e: print(f"ERROR saving HPT splits: {e}")
+
+    # --- 10. Save Metadata ---
+    print("\n===== STEP 10: Saving Metadata =====")
     n_features = len(final_feature_names_after_vt)
+    n_classes = len(target_map)
 
-    print("Calculating n_classes from target_state column in fitting data...")
-    # Use the target_map keys/values directly as n_classes should be fixed at 3
-    # unique_target_values_inc_na = df_final_fit['target_state'].unique()
-    # valid_target_values = unique_target_values_inc_na[~pd.isna(unique_target_values_inc_na)]
-    # n_classes = len(valid_target_values)
-    n_classes = len(target_map) # Should be 3 based on the map definition
-    print(f"Using n_classes based on target_map: {n_classes}")
-
-    # Add a check that the actual values in target_state match the map keys
-    if not df_final_fit.empty:
-        actual_targets = df_final_fit['target_state'].dropna().unique()
+    # Add a check that the actual values in target_state match the map keys (check on a non-empty split if possible)
+    check_df_for_targets = full_train_data_baked if not full_train_data_baked.empty else hpt_train_data_baked
+    if not check_df_for_targets.empty:
+        actual_targets = check_df_for_targets['target_state'].dropna().unique()
         expected_targets = target_map.values()
         if not set(actual_targets).issubset(set(expected_targets)):
              print(f"WARNING: Found target_state values {actual_targets} not fully contained in expected map values {expected_targets}.")
-             # Decide if this is critical enough to stop
-             # return # Stop execution
-
     if n_classes != 3:
         print(f"ERROR: Expected 3 classes based on target_map, but map has {n_classes} entries.")
         print("STOPPING: Incorrect number of target classes determined from map.")
@@ -597,28 +652,40 @@ def preprocess_data():
     else:
         print("Confirmed n_classes = 3.")
 
-
     metadata = {
         'feature_names': final_feature_names_after_vt.tolist(),
         'n_features': n_features,
         'n_classes': n_classes,
-        'target_state_map': target_map, # Use map defined in apply_cleaning
-        'target_state_map_inverse': target_map_inverse, # Use inverse map from apply_cleaning
+        'target_state_map': target_map,
+        'target_state_map_inverse': target_map_inverse,
         'original_identifier_columns': original_id_cols,
         'pad_value': config.PAD_VALUE,
-        'hpt_validation_intervals': config.HPT_VALIDATION_INTERVALS, # Store the intervals
-        'train_individuals': len(train_ids),
-        'val_individuals': len(val_ids),
-        'test_individuals': len(test_ids),
-        'train_rows_baked': len(train_data_baked),
-        'val_rows_baked': len(val_data_baked),
+        'hpt_validation_intervals': config.HPT_VALIDATION_INTERVALS,
+        'train_end_date_preprocess': str(train_end_dt_preprocess.date()) if train_end_dt_preprocess else None,
+        # Counts for FULL splits
+        'full_train_individuals': len(full_train_ids),
+        'full_val_individuals': len(full_val_ids),
+        'full_train_rows_baked': len(full_train_data_baked),
+        'full_val_rows_baked': len(full_val_data_baked),
+        # Counts for HPT splits
+        'hpt_train_individuals': len(hpt_train_ids),
+        'hpt_val_individuals': len(hpt_val_ids),
+        'hpt_train_rows_baked': len(hpt_train_data_baked),
+        'hpt_val_rows_baked': len(hpt_val_data_baked),
+        # Counts for other splits
+        'test_individuals': test_data_baked['cpsidp'].nunique() if not test_data_baked.empty else 0,
         'test_rows_baked': len(test_data_baked),
-        'hpt_val_rows_baked': len(hpt_baked_df), # Add count for HPT val set
-        'full_baked_rows': len(full_baked_df), # Add count for the full baked set
+        'hpt_interval_individuals': hpt_interval_data_baked['cpsidp'].nunique() if not hpt_interval_data_baked.empty else 0,
+        'hpt_interval_rows_baked': len(hpt_interval_data_baked),
+        # File paths
         'preprocessing_pipeline_path': str(preprocessor_file),
-        'hpt_validation_data_path': str(hpt_val_file) if not hpt_baked_df.empty else None, # Check if df is empty
-        'full_baked_data_path': str(full_baked_file), # Ensure this uses the correct variable
-        'weight_column': 'wtfinl' # Add weight column name to metadata
+        'full_train_data_path': str(full_train_file),
+        'full_val_data_path': str(full_val_file),
+        'hpt_train_data_path': str(hpt_train_file),
+        'hpt_val_data_path': str(hpt_val_file),
+        'test_data_path': str(test_file) if not test_data_baked.empty else None,
+        'hpt_interval_data_path': str(hpt_interval_data_file) if not hpt_interval_data_baked.empty else None,
+        'weight_column': config.WEIGHT_COL
     }
 
     try:

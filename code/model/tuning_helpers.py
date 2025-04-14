@@ -24,7 +24,7 @@ from forecasting_helpers import calculate_hpt_forecast_metrics, evaluate_aggrega
 # --- Optuna Objective Function ---
 
 def objective(trial: optuna.Trial, train_evaluate_func,
-              hpt_val_baked_data, # Still needed by train_evaluate_func
+              processed_data_dir: Path, # ADDED - Need path to load data
               national_rates_file: Path, # Path to truth data
               metadata, device):
     """
@@ -33,7 +33,7 @@ def objective(trial: optuna.Trial, train_evaluate_func,
     Args:
         trial (optuna.Trial): Optuna trial object.
         train_evaluate_func (callable): The function that trains the model and returns results.
-        hpt_val_baked_data (pd.DataFrame): HPT validation data (needed for forecast calculation).
+        processed_data_dir (Path): Path to the directory containing processed data.
         national_rates_file (Path): Path to the CSV with actual national rates.
         metadata (dict): Loaded metadata (must contain 'hpt_validation_intervals').
         device (torch.device): The device to use.
@@ -70,8 +70,8 @@ def objective(trial: optuna.Trial, train_evaluate_func,
         'pad_value': config.PAD_VALUE,
         'parallel_workers': config.PARALLEL_WORKERS,
         'refresh_sequences': config.REFRESH_SEQUENCES, # Usually False during HPT
-        'train_start_date': config.TRAIN_START_DATE,
-        'train_end_date': config.TRAIN_END_DATE,
+        # 'train_start_date': config.TRAIN_START_DATE, # REMOVED
+        # 'train_end_date': config.TRAIN_END_DATE, # REMOVED
         'random_seed': config.RANDOM_SEED,
         # Add HPT forecast horizon
         'hpt_forecast_horizon': config.HPT_FORECAST_HORIZON,
@@ -117,7 +117,7 @@ def objective(trial: optuna.Trial, train_evaluate_func,
             # Assumes calculate_hpt_forecast_metrics returns a dict: {'rmse': value, 'variance': value}
             forecast_metrics = calculate_hpt_forecast_metrics(
                 model=model,
-                hpt_val_baked_data=hpt_val_baked_data, # Data within intervals
+                processed_data_dir=processed_data_dir, # ADDED
                 national_rates_file=national_rates_file, # Pass the path
                 metadata=metadata, # Pass full metadata (contains intervals)
                 params=hparams, # Pass the hyperparameters used for this trial
@@ -247,42 +247,29 @@ def run_hyperparameter_tuning(args, base_output_dir, train_evaluate_func):
     print(f"HPT Loss Weight Factor Range: [{config.HPT_LOSS_WEIGHT_FACTOR_MIN}, {config.HPT_LOSS_WEIGHT_FACTOR_MAX}] (0=Unweighted, 1=Inverse Freq)")
 
     # --- Load Data needed for Objective Calculation ---
-    # Load HPT baked data (for forecast calc) and metadata (for intervals)
-    print("\nLoading data needed for HPT objective calculation...")
+    # REMOVED loading of hpt_val_baked_data here. Only need paths and metadata.
+    print("\nLoading paths and metadata needed for HPT objective calculation...")
     processed_data_dir = Path(config.PREPROCESS_OUTPUT_DIR)
-    hpt_val_file = processed_data_dir / config.HPT_VAL_DATA_FILENAME
-    national_rates_file = config.NATIONAL_RATES_FILE # Get path from config
+    national_rates_file = config.NATIONAL_RATES_FILE
     metadata_file = processed_data_dir / config.METADATA_FILENAME
-    hpt_val_baked_data = None
     metadata = None
     try:
-        if not hpt_val_file.exists():
-            raise FileNotFoundError(f"HPT validation data file not found: {hpt_val_file}")
         if not national_rates_file.exists():
             raise FileNotFoundError(f"National rates file not found: {national_rates_file}")
         if not metadata_file.exists():
             raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
 
-        hpt_val_baked_data = pd.read_parquet(hpt_val_file)
         with open(metadata_file, 'rb') as f:
             metadata = pickle.load(f)
-        # Optional: Apply date filtering from config to HPT val data if needed
-        hpt_val_baked_data[config.DATE_COL] = pd.to_datetime(hpt_val_baked_data[config.DATE_COL])
-        if config.TRAIN_START_DATE:
-             hpt_val_baked_data = hpt_val_baked_data[hpt_val_baked_data[config.DATE_COL] >= pd.to_datetime(config.TRAIN_START_DATE)].copy()
-        if config.TRAIN_END_DATE:
-             hpt_val_baked_data = hpt_val_baked_data[hpt_val_baked_data[config.DATE_COL] <= pd.to_datetime(config.TRAIN_END_DATE)].copy()
 
-        if hpt_val_baked_data.empty:
-            raise ValueError("HPT validation data is empty after loading/filtering.")
         if 'hpt_validation_intervals' not in metadata:
             raise ValueError("Metadata loaded, but 'hpt_validation_intervals' key is missing.")
-        print(f"Loaded HPT validation data ({hpt_val_baked_data.shape}) and metadata.")
+        print(f"Loaded metadata.") # Simplified print
         print(f"Using HPT intervals from metadata: {metadata['hpt_validation_intervals']}")
         print(f"Using national rates file: {national_rates_file}")
 
     except Exception as e:
-        print(f"ERROR: Failed to load data needed for HPT objective: {e}")
+        print(f"ERROR: Failed to load data/metadata needed for HPT objective: {e}")
         traceback.print_exc()
         sys.exit(1)
 
@@ -314,7 +301,7 @@ def run_hyperparameter_tuning(args, base_output_dir, train_evaluate_func):
     try:
         # Pass necessary arguments to the objective function using a lambda
         study.optimize(
-            lambda trial: objective(trial, train_evaluate_func, hpt_val_baked_data, national_rates_file, metadata, device),
+            lambda trial: objective(trial, train_evaluate_func, processed_data_dir, national_rates_file, metadata, device), # Pass dir instead of data
             n_trials=args.n_trials,
             timeout=config.HPT_TIMEOUT_SECONDS,
             gc_after_trial=True, # Garbage collect after each trial
@@ -369,5 +356,5 @@ def run_hyperparameter_tuning(args, base_output_dir, train_evaluate_func):
     except Exception as e: print(f"Error retrieving final study results: {e}")
 
     # Clean up large data
-    del hpt_val_baked_data, metadata
+    del metadata
     gc.collect()

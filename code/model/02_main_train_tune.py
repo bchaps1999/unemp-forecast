@@ -56,11 +56,14 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
     stop_training_flag = False # Reset flag at the start of each run/trial
     training_was_interrupted = False # Track if training loop specifically was interrupted
 
+    # Determine if this is an HPT run based on the presence of the trial object
+    is_hpt_run = trial is not None
+
     original_sigint_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, signal_handler)
 
     start_run_time = time.time()
-    std_val_agg_error_final = float('inf') # Error on standard validation set
+    std_val_agg_error_final = float('inf') # Error on standard validation set for the run type
     best_val_loss_final = float('inf')
     final_val_acc_final = float('nan')
     best_epoch_final = -1
@@ -78,7 +81,7 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
     try:
         # --- Setup Run Info & Dirs ---
         print("=" * 60)
-        run_type = f"Optuna Trial {trial.number}" if trial else "Standard Run"
+        run_type = f"Optuna Trial {trial.number}" if is_hpt_run else "Standard Run" # Use is_hpt_run
         print(f"Starting Transformer Model Run: {run_type}")
         print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("Hyperparameters:")
@@ -103,14 +106,23 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
         print(f"Random seeds set to: {seed_value}")
 
         # --- Step 1: Load Data (Baked) ---
-        train_file = processed_data_dir / config.TRAIN_DATA_FILENAME
-        val_file = processed_data_dir / config.VAL_DATA_FILENAME
+        # Determine which files to load based on run type
+        if is_hpt_run: # Use the defined variable
+            # Uses HPT_TRAIN/VAL_DATA_FILENAME which are derived from the full pool but potentially sampled differently
+            print("Loading HPT-specific train/validation data (sampled from full pre-test pool)...")
+            train_file = processed_data_dir / config.HPT_TRAIN_DATA_FILENAME
+            val_file = processed_data_dir / config.HPT_VAL_DATA_FILENAME
+        else:
+            # Uses FULL_TRAIN/VAL_DATA_FILENAME which are derived from the full pool
+            print("Loading FULL train/validation data (sampled from full pre-test pool)...")
+            train_file = processed_data_dir / config.FULL_TRAIN_DATA_FILENAME
+            val_file = processed_data_dir / config.FULL_VAL_DATA_FILENAME
+
         hpt_val_file = processed_data_dir / config.HPT_VAL_DATA_FILENAME # Path only
         metadata_file = processed_data_dir / config.METADATA_FILENAME
         # Load train/val/metadata. HPT val data is loaded separately in run_hyperparameter_tuning if needed.
         train_data_baked, val_data_baked, _, metadata, feature_names, n_features, n_classes = load_and_prepare_data(
-            train_file, val_file, hpt_val_file, metadata_file, config.DATE_COL, config.GROUP_ID_COL,
-            hparams.get('train_start_date'), hparams.get('train_end_date')
+            train_file, val_file, hpt_val_file, metadata_file, config.DATE_COL, config.GROUP_ID_COL
         )
 
         # --- Add derived params to hparams for saving ---
@@ -227,7 +239,10 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
         stop_training_flag = False
 
         # --- Step 7: Final Evaluation (on Standard Validation Set - Aggregate Error) ---
-        print("\n===== STEP 5: Evaluating Model (Weighted Aggregate Error on Standard Val Set) =====")
+        # This evaluation uses the validation set corresponding to the run type (HPT val or Full val)
+        print("\n===== STEP 5: Evaluating Model (Weighted Aggregate Error on Validation Set) =====")
+        eval_set_name = "HPT Validation Set" if is_hpt_run else "Full Validation Set" # Use is_hpt_run
+        print(f"Evaluating on: {eval_set_name}") # This print is correct
 
         # Load best weights (based on standard val loss) if checkpoint exists and training wasn't interrupted prematurely
         if checkpoint_path.exists() and not training_was_interrupted:
@@ -253,14 +268,15 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
         else:
             print("Standard validation dataset/params not available. Skipping final evaluation on this set.")
 
-        # Run weighted evaluation on standard validation set
+        # Run weighted evaluation on the appropriate validation set
         if final_val_loader and model:
             model.eval() # Ensure model is in eval mode
+            # Use the standard evaluation function
             std_val_agg_error_final = evaluate_aggregate_unemployment_error(model, final_val_loader, DEVICE, metadata)
-            print(f"Final Weighted Aggregate Unemployment Rate Error (MSE) on Standard Validation Set: {std_val_agg_error_final:.6f}")
+            print(f"Final Weighted Aggregate Unemployment Rate Error (MSE) on {eval_set_name}: {std_val_agg_error_final:.6f}")
         else:
             std_val_agg_error_final = float('inf') # Mark as infinite if not evaluated
-            print("Final Weighted Aggregate Unemployment Rate Error (MSE) on Standard Validation Set: Not Calculated")
+            print(f"Final Weighted Aggregate Unemployment Rate Error (MSE) on {eval_set_name}: Not Calculated")
 
         # --- Extract Final Metrics ---
         try:
@@ -332,8 +348,8 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
 
     # Return results including the model if completed successfully
     results = {
-        'model': model if run_status == "Completed" else None, # Return model only if run completed
-        'std_val_agg_error': std_val_agg_error_final,
+        'model': model if run_status == "Completed" else None,
+        'std_val_agg_error': std_val_agg_error_final, # Reverted key name
         'best_val_loss': best_val_loss_final,
         'final_val_acc': final_val_acc_final,
         'best_epoch': best_epoch_final,
@@ -373,8 +389,6 @@ def run_standard_training(args, base_output_dir):
         'pad_value': config.PAD_VALUE,
         'parallel_workers': config.PARALLEL_WORKERS,
         'refresh_sequences': config.REFRESH_SEQUENCES, # Use standard setting
-        'train_start_date': config.TRAIN_START_DATE,
-        'train_end_date': config.TRAIN_END_DATE,
         'random_seed': config.RANDOM_SEED,
         # Add HPT forecast horizon (not used directly in standard run, but good practice)
         'hpt_forecast_horizon': config.HPT_FORECAST_HORIZON,
@@ -403,7 +417,7 @@ def run_standard_training(args, base_output_dir):
                     num_updated = 0
                     # Load only tunable keys from CSV
                     # Add 'loss_weight_factor' to the list of tunable keys
-                    tunable_keys_from_csv = [col for col in trial_params_csv if col in standard_hparams and col not in ['sequence_length', 'epochs', 'refresh_sequences', 'early_stopping_patience', 'max_grad_norm', 'lr_scheduler_factor', 'lr_scheduler_patience', 'pad_value', 'parallel_workers', 'train_start_date', 'train_end_date', 'random_seed', 'hpt_forecast_horizon']]
+                    tunable_keys_from_csv = [col for col in trial_params_csv if col in standard_hparams and col not in ['sequence_length', 'epochs', 'refresh_sequences', 'early_stopping_patience', 'max_grad_norm', 'lr_scheduler_factor', 'lr_scheduler_patience', 'pad_value', 'parallel_workers', 'random_seed', 'hpt_forecast_horizon']]
 
                     for key in tunable_keys_from_csv:
                         value = trial_params_csv[key]
@@ -482,10 +496,11 @@ def run_standard_training(args, base_output_dir):
              print(f"ERROR: 'batch_size' missing from final standard_hparams. Using default: {config.BATCH_SIZE}")
              standard_hparams['batch_size'] = config.BATCH_SIZE
 
-        # Call the internal training function without a trial object
+        # Call the internal training function without a trial object (is_hpt_run will be False)
         results = train_and_evaluate_internal(standard_hparams, trial=None)
         print(f"\nStandard run finished with status: {results['status']}")
-        print(f"Final Aggregate Unemployment Error (Standard Validation Set): {results['std_val_agg_error']:.6f}")
+        # Use the reverted key name from the results dictionary
+        print(f"Final Aggregate Unemployment Error (Full Validation Set): {results['std_val_agg_error']:.6f}")
 
         # Clean up the returned model object if it exists
         if results.get('model') is not None:

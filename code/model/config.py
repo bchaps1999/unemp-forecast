@@ -20,7 +20,10 @@ PREPROCESS_INPUT_FILE = PROJECT_ROOT / "data/processed/cps_transitions.csv"
 PREPROCESS_OUTPUT_DIR = PROJECT_ROOT / "data/processed/transformer_input"
 PREPROCESS_START_DATE = None # "YYYY-MM-DD" or None
 PREPROCESS_END_DATE = None   # "YYYY-MM-DD" or None
-PREPROCESS_NUM_INDIVIDUALS = None # Integer or None
+# Sampling for FINAL training/validation splits (after HPT)
+PREPROCESS_NUM_INDIVIDUALS_FULL = 50000 # Integer or None for all individuals before TRAIN_END_DATE (excluding HPT intervals)
+# Sampling for HPT training/validation splits (during HPT)
+PREPROCESS_NUM_INDIVIDUALS_HPT = 50000 # Integer or None for all individuals before HPT intervals
 TRAIN_SPLIT = 0.7
 VAL_SPLIT = 0.15
 # Test split is implicitly 1 - TRAIN_SPLIT - VAL_SPLIT
@@ -35,24 +38,30 @@ HPT_VALIDATION_INTERVALS = [
     ("2013-01-01", "2014-03-01"),
     ("2018-01-01", "2019-03-01"),
 ]
+# Define the end date for the main training set (used to separate test data)
+# Must be after the latest HPT_VALIDATION_INTERVALS end date if they overlap
+TRAIN_END_DATE_PREPROCESS = "2019-12-31" # Date used during preprocessing to split train/test
 
-# Derived Preprocessing Output Filenames (used by training script)
-TRAIN_DATA_FILENAME = "train_baked.parquet"
-VAL_DATA_FILENAME = "val_baked.parquet"
+# Derived Preprocessing Output Filenames
+# HPT-specific splits (smaller, used during tuning)
+HPT_TRAIN_DATA_FILENAME = "hpt_train_baked.parquet"
+HPT_VAL_DATA_FILENAME = "hpt_val_baked.parquet"
+# Full splits (potentially larger, used for final model training)
+FULL_TRAIN_DATA_FILENAME = "full_train_baked.parquet"
+FULL_VAL_DATA_FILENAME = "full_val_baked.parquet"
+# Test split (data after TRAIN_END_DATE_PREPROCESS)
 TEST_DATA_FILENAME = "test_baked.parquet"
-HPT_VAL_DATA_FILENAME = "hpt_val_data.parquet" # Filename for HPT validation data
+# HPT Validation split (data within HPT_VALIDATION_INTERVALS + lookback)
+HPT_INTERVAL_DATA_FILENAME = "hpt_interval_data_baked.parquet" # Renamed for clarity
 METADATA_FILENAME = "preprocessing_metadata.pkl"
-RECIPE_FILENAME = "preprocessing_recipe.pkl" # Although not created by preprocess, it's related
-FULL_DATA_FILENAME = "full_baked.parquet" # New filename for all processed data
+RECIPE_FILENAME = "preprocessing_recipe.pkl" # Preprocessing pipeline
+# FULL_BAKED_FILENAME = "full_baked.parquet" # REMOVED - Redundant
 NATIONAL_RATES_FILE = PROJECT_ROOT / "data/processed/national_unemployment_rate.csv" # Path for national rates
 
 # --- 02_train_transformer.py Parameters ---
 # Input directory is PREPROCESS_OUTPUT_DIR
-TRAIN_OUTPUT_SUBDIR = PROJECT_ROOT / "models" # Removed /standard_run
+TRAIN_OUTPUT_SUBDIR = PROJECT_ROOT / "models"
 SEQUENCE_CACHE_DIR_NAME = "sequence_cache_py" # Relative to PREPROCESS_OUTPUT_DIR
-# Add date filtering for training data (applied *after* loading baked data)
-TRAIN_START_DATE = None # "YYYY-MM-DD" or None to use all available data before TRAIN_END_DATE
-TRAIN_END_DATE = "2019-12-31"   # "YYYY-MM-DD" or None to use all available data after TRAIN_START_DATE
 
 # Model Hyperparameters
 SEQUENCE_LENGTH = 28 # Forecast periods + 16 (max possible length of CPS history)
@@ -62,6 +71,7 @@ NUM_TRANSFORMER_BLOCKS = 2
 MLP_UNITS = [64] # List of units for MLP head layers
 DROPOUT = 0.1 # Dropout rate for transformer blocks
 MLP_DROPOUT = 0.2 # Dropout rate for MLP head
+EMBED_DIM = 64 # Embedding dimension (added)
 EPOCHS = 75
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
@@ -91,6 +101,8 @@ HPT_OBJECTIVE_METRIC = 'variance' # Choose 'rmse' or 'variance' to minimize
 HPT_FORECAST_HORIZON = 12 # Number of months to forecast in HPT objective calculation
 HPT_RESULTS_CSV = "hpt_results.csv" # Filename for HPT results log within study dir
 BEST_HPARAMS_PKL = "best_hparams.pkl" # Filename for best HPT params within study dir
+# HPT Validation Data Path (used by HPT objective function)
+# HPT_VALIDATION_DATA_PATH_FOR_METRIC = PREPROCESS_OUTPUT_DIR / HPT_INTERVAL_DATA_FILENAME # REMOVED - Path constructed directly in tuning_helpers
 
 # HPT Search Space Definitions
 HPT_EMBED_DIM_OPTIONS = [32, 64, 128]
@@ -126,6 +138,8 @@ HPT_PRUNER_WARMUP = 3 # Number of epochs within a trial before pruning can occur
 # Input directory for baked data is PREPROCESS_OUTPUT_DIR
 # Input directory for model is TRAIN_OUTPUT_SUBDIR
 FORECAST_OUTPUT_SUBDIR = PROJECT_ROOT / "output/forecast_transformer"
+# Input data for forecasting will be TEST_DATA_FILENAME
+# FORECAST_INPUT_DATA_FILENAME = FULL_BAKED_FILENAME # REMOVED
 
 # Simulation Parameters
 FORECAST_PERIODS = 12 # Number of periods to forecast ahead
