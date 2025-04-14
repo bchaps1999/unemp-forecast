@@ -78,22 +78,21 @@ message("Executing model pipeline shell script...")
 original_wd <- getwd() # Store current WD
 setwd(project_root)   # Change to project root
 message("Temporarily changed WD to project root for system2: ", getwd())
-result <- system2(command = "bash", args = shQuote(model_pipeline_script), stdout = TRUE, stderr = TRUE)
+# Change stdout/stderr to "" to print live output to R console
+# The return value 'exit_status' will contain the exit code directly
+exit_status <- system2(command = "bash", args = shQuote(model_pipeline_script), stdout = "", stderr = "")
 setwd(original_wd)   # Change back to original WD
 message("Restored WD: ", getwd())
 
-# Check execution status
-if (length(attr(result, "status")) > 0 && attr(result, "status") != 0) {
+# Check execution status using the direct return value
+if (exit_status != 0) {
   message("--- Model Pipeline Script FAILED ---")
-  message("Exit Status: ", attr(result, "status"))
-  message("Output/Error:")
-  cat(result, sep = "\n")
+  message("Exit Status: ", exit_status)
+  # Output was already printed live to the console
   stop("Model pipeline script execution failed.")
 } else {
   message("--- Model Pipeline Script FINISHED Successfully ---")
-  # Print output if desired
-  # message("Output:")
-  # cat(result, sep = "\n")
+  # Output was already printed live to the console
 }
 
 # --- 5. Completion ---

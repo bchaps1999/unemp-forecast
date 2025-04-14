@@ -5,7 +5,6 @@
 /attic
 .Rproj.user
 /models
-# .Rhistory
 *.Rproj
 *.RData
 *.Rhistory

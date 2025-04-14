@@ -42,17 +42,6 @@ else
   exit 1
 fi
 
-# --- 3. Run R Preprocessing Script (Optional - uncomment if needed) ---
-# echo "\n--- Running R Data Preprocessing Script ---"
-# R_SCRIPT_PATH="$PROJECT_ROOT/code/data/get_data.R"
-# if [ -f "$R_SCRIPT_PATH" ]; then
-#   echo "Executing R script: $R_SCRIPT_PATH"
-#   Rscript "$R_SCRIPT_PATH"
-#   echo "R script finished."
-# else
-#   echo "WARNING: R script not found at $R_SCRIPT_PATH. Skipping."
-# fi
-
 # --- 4. Run Python Scripts ---
 # Navigate to the script directory to ensure relative paths in Python scripts work as expected
 cd "$SCRIPT_DIR"
