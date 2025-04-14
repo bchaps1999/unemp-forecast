@@ -6,3 +6,9 @@
 .Rproj.user
 /models
 # .Rhistory
+*.Rproj
+*.RData
+*.Rhistory
+*.Rprofile
+*__pycache__*
+.DS_Store

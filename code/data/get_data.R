@@ -10,19 +10,21 @@
 project_root <- "/Users/brendanchapuis/Projects/research/labor-abm"
 
 # Source required modules
-source(file.path(project_root, "code", "build", "data", "scrape_cps_samples.R"))
-source(file.path(project_root, "code", "build", "data", "clean_cps.R"))
+source(file.path(project_root, "code", "data", "scrape_cps_samples.R"))
+source(file.path(project_root, "code", "data", "clean_cps.R"))
 
 # --- Define Pipeline Parameters --- 
 # These parameters will be used when the script is sourced.
 output_file_param <- "data/processed/cps_transitions.csv"
+# Add parameter for national rates file
+national_rates_output_file_param <- "data/processed/national_unemployment_rate.csv"
 # refresh_extract_param: If TRUE, forces a new download request to IPUMS.
 # If FALSE, uses existing downloaded files if they cover the extract date range.
 # Re-processing of the data happens whenever this script is sourced, regardless of this flag.
 refresh_extract_param <- FALSE 
 force_scrape_param <- FALSE
 # Dates for the IPUMS extract request
-extract_start_date_param <- "2005-01" 
+extract_start_date_param <- "2000-01" 
 extract_end_date_param <- "2025-03"
 # Dates to subset the downloaded data for processing/analysis
 subset_start_date_param <- "2005-01"
@@ -34,7 +36,8 @@ debug_param <- TRUE # Set to TRUE for verbose output during sourced run
 #' Run the CPS data pipeline
 #'
 #' @param project_root Path to the project root directory
-#' @param output_file Path to save the output CSV (relative to project_root)
+#' @param output_file Path to save the main output CSV (relative to project_root)
+#' @param national_rates_output_file Path to save the national rates CSV (relative to project_root)
 #' @param refresh_extract Whether to force retrieving a new extract from IPUMS
 #' @param force_scrape Whether to force re-scraping sample IDs
 #' @param extract_start_date Start date for IPUMS extract request (YYYY-MM)
@@ -43,10 +46,11 @@ debug_param <- TRUE # Set to TRUE for verbose output during sourced run
 #' @param subset_end_date End date for filtering the data subset (YYYY-MM)
 #' @param include_asec Whether to include ASEC samples
 #' @param debug Print debug information
-#' @return Path to the created output file
+#' @return Path to the created main output file
 run_cps_pipeline <- function(
   project_root,
   output_file = "data/processed/cps_transitions.csv",
+  national_rates_output_file = "data/processed/national_unemployment_rate.csv", # Add new parameter
   refresh_extract = FALSE,
   force_scrape = FALSE,
   extract_start_date = "2018-01",
@@ -92,7 +96,10 @@ run_cps_pipeline <- function(
   # Setup
   load_cps_packages()
   output_path <- file.path(project_root, output_file)
+  national_rates_path <- file.path(project_root, national_rates_output_file) # Define full path
   dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+  # Ensure directory for national rates exists too
+  dir.create(dirname(national_rates_path), recursive = TRUE, showWarnings = FALSE)
   init_ipums_api(project_root)
   
   # Step 1: Identify CPS samples (using extract dates)
@@ -134,8 +141,9 @@ run_cps_pipeline <- function(
   }
 
   # Step 3: Process data into panel format (using already subsetted data)
-  message("\n===== STEP 3: Creating panel dataset =====")
-  cps_panel <- process_cps_data(cps_data)
+  message("\n===== STEP 3: Creating panel dataset & Saving National Rates =====")
+  # Pass the national_rates_path to process_cps_data
+  cps_panel <- process_cps_data(cps_data, national_rates_output_path = national_rates_path)
   rm(cps_data); gc()
   
   if (debug) {
@@ -156,8 +164,8 @@ run_cps_pipeline <- function(
   message("\n===== STEP 4.5: Labeling variables =====")
   final_data <- label_variables(final_data) 
   
-  # Step 5: Save the processed data
-  message("\n===== STEP 5: Saving processed data =====")
+  # Step 5: Save the processed data (individual level)
+  message("\n===== STEP 5: Saving processed individual-level data =====")
   # Convert necessary columns before saving
   # Use data.table::fwrite for potentially faster writing
   final_dt <- as.data.table(final_data) # Ensure it's a data.table
@@ -172,8 +180,13 @@ run_cps_pipeline <- function(
   end_time <- Sys.time()
   elapsed <- difftime(end_time, start_time, units = "mins")
   message("\nPipeline completed in ", round(as.numeric(elapsed), 2), " minutes")
-  message("Output saved to: ", output_path)
-  
+  message("Individual-level output saved to: ", output_path)
+  if (file.exists(national_rates_path)) {
+      message("National rates output saved to: ", national_rates_path)
+  } else {
+      message("National rates file was not saved (check path or function).")
+  }
+
   rm(final_data, final_dt); gc() # Clean up both objects
   return(output_path)
 }
@@ -183,6 +196,7 @@ run_cps_pipeline <- function(
 run_cps_pipeline(
   project_root = project_root,
   output_file = output_file_param,
+  national_rates_output_file = national_rates_output_file_param, # Pass new param
   refresh_extract = refresh_extract_param,
   force_scrape = force_scrape_param,
   extract_start_date = extract_start_date_param,

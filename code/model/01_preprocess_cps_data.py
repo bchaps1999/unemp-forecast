@@ -79,26 +79,86 @@ def preprocess_data():
             print(f"Filtered data before overall end date ({config.PREPROCESS_END_DATE}): {df.shape}")
 
         # --- Time-based Split for HPT Validation ---
-        print("\nSplitting data for HPT validation...")
-        if not hasattr(config, 'HPT_VALIDATION_START_DATE') or not config.HPT_VALIDATION_START_DATE:
-            print("ERROR: config.HPT_VALIDATION_START_DATE is not defined. Cannot perform time-based split.")
+        print("\nSplitting data based on HPT validation intervals...")
+        if not hasattr(config, 'HPT_VALIDATION_INTERVALS') or not config.HPT_VALIDATION_INTERVALS:
+            print("ERROR: config.HPT_VALIDATION_INTERVALS is not defined or empty. Cannot perform time-based split.")
             sys.exit(1)
 
-        hpt_val_start_dt = pd.to_datetime(config.HPT_VALIDATION_START_DATE)
-        print(f"Using HPT validation start date: {hpt_val_start_dt.date()}")
-
-        data_for_fitting_raw = df[df['date'] < hpt_val_start_dt].copy()
-        hpt_val_data_raw = df[df['date'] >= hpt_val_start_dt].copy()
-
-        print(f"Data for fitting/standard splits (before {hpt_val_start_dt.date()}): {data_for_fitting_raw.shape}")
-        print(f"Data for HPT validation (on/after {hpt_val_start_dt.date()}): {hpt_val_data_raw.shape}")
-
-        if data_for_fitting_raw.empty:
-            print("ERROR: No data available before HPT_VALIDATION_START_DATE. Cannot proceed.")
+        # Convert interval strings to datetime and find the earliest start date
+        hpt_intervals = []
+        earliest_hpt_start_dt = None
+        try:
+            for start_str, end_str in config.HPT_VALIDATION_INTERVALS:
+                start_dt = pd.to_datetime(start_str)
+                end_dt = pd.to_datetime(end_str)
+                if start_dt > end_dt:
+                    raise ValueError(f"Start date {start_str} is after end date {end_str} in HPT interval.")
+                hpt_intervals.append((start_dt, end_dt))
+                if earliest_hpt_start_dt is None or start_dt < earliest_hpt_start_dt:
+                    earliest_hpt_start_dt = start_dt
+            print(f"Using HPT validation intervals: {[(s.date(), e.date()) for s, e in hpt_intervals]}")
+        except Exception as e:
+            print(f"ERROR processing HPT_VALIDATION_INTERVALS: {e}")
             sys.exit(1)
-        if hpt_val_data_raw.empty:
-            print("WARNING: No data available on/after HPT_VALIDATION_START_DATE for HPT validation set.")
-            # Proceed, but HPT evaluation might yield trivial results.
+
+        # For HPT validation, we need:
+        # 1. All data within the intervals
+        # 2. Historical data for individuals who appear in those intervals (for sequencing)
+        
+        # First, identify all observations within the HPT intervals
+        hpt_masks = []
+        for start_dt, end_dt in hpt_intervals:
+            hpt_masks.append((df['date'] >= start_dt) & (df['date'] <= end_dt))
+        combined_hpt_mask = pd.concat(hpt_masks, axis=1).any(axis=1)
+        
+        # Get all individuals who appear in any HPT validation interval
+        individuals_in_hpt = df.loc[combined_hpt_mask, 'cpsidp'].unique()
+        print(f"Found {len(individuals_in_hpt)} unique individuals in HPT validation intervals")
+        
+        # Calculate lookback period (use sequence length from config if available, otherwise default to 24)
+        lookback_months = getattr(config, 'SEQUENCE_LENGTH', 24)
+        
+        # For each interval, include data within the interval PLUS lookback data for relevant individuals
+        hpt_extended_masks = []
+        for start_dt, end_dt in hpt_intervals:
+            # Calculate lookback start date
+            lookback_start_dt = start_dt - pd.DateOffset(months=lookback_months)
+            
+            # Create mask for observations within interval
+            interval_mask = (df['date'] >= start_dt) & (df['date'] <= end_dt)
+            
+            # Find individuals in this specific interval
+            individuals_this_interval = df.loc[interval_mask, 'cpsidp'].unique()
+            
+            # Create mask for lookback data (only for individuals in this interval)
+            lookback_mask = (
+                (df['date'] >= lookback_start_dt) & 
+                (df['date'] < start_dt) & 
+                (df['cpsidp'].isin(individuals_this_interval))
+            )
+            
+            # Combine interval and its lookback data
+            extended_interval_mask = interval_mask | lookback_mask
+            hpt_extended_masks.append(extended_interval_mask)
+        
+        # Combine all extended interval masks
+        combined_extended_mask = pd.concat(hpt_extended_masks, axis=1).any(axis=1)
+        
+        # Get all HPT validation data including lookback periods
+        hpt_val_data_raw = df[combined_extended_mask].copy()
+        
+        # Data for fitting/standard splits is all data NOT in the HPT validation intervals (including lookback)
+        data_for_fitting_raw = df[~combined_extended_mask].copy()
+        
+        print(f"Data for fitting/standard splits (excluding HPT intervals & lookback): {data_for_fitting_raw.shape}")
+        print(f"Data for HPT validation (intervals + lookback): {hpt_val_data_raw.shape}")
+        print(f"  - Including lookback of {lookback_months} months before each interval")
+
+        # Verify the two datasets include all observations and have no overlap
+        total_raw_rows = len(data_for_fitting_raw) + len(hpt_val_data_raw)
+        expected_total = len(df)
+        if total_raw_rows != expected_total:
+            print(f"WARNING: Unexpected count mismatch. Combined splits ({total_raw_rows}) vs original data ({expected_total})")
 
         # --- Continue Cleaning and Feature Engineering (on both splits if needed, or apply functions) ---
         # Apply cleaning/feature engineering steps consistently.
@@ -546,6 +606,7 @@ def preprocess_data():
         'target_state_map_inverse': target_map_inverse, # Use inverse map from apply_cleaning
         'original_identifier_columns': original_id_cols,
         'pad_value': config.PAD_VALUE,
+        'hpt_validation_intervals': config.HPT_VALIDATION_INTERVALS, # Store the intervals
         'train_individuals': len(train_ids),
         'val_individuals': len(val_ids),
         'test_individuals': len(test_ids),

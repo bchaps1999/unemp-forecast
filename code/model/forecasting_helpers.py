@@ -15,57 +15,14 @@ from tqdm import tqdm
 import math
 import sys
 import gc # Import garbage collector
+from sklearn.metrics import mean_squared_error
 
-# Fix imports - add the parent directory of this script to sys.path
-# Assumes 'models.py' and 'config.py' are in the parent directory
-# e.g., project_root/scripts/this_script.py and project_root/models.py
-script_dir = Path(__file__).resolve().parent
-
-# Import Model Definitions and Config with absolute import path logic
-try:
-    from models import PositionalEmbedding, TransformerEncoderBlock, TransformerForecastingModel
-except ImportError as e:
-    print(f"ERROR: Could not import from models.py. Ensure it exists in {script_dir}. Details: {e}") # Updated error message path
-    sys.exit(1)
-
-try:
-    import config
-except ImportError:
-    print(f"ERROR: config.py not found. Make sure it's in {script_dir} or sys.path is configured correctly.") # Updated error message path
-    sys.exit(1)
-
-# --- Constants --- (Moved relevant constants to config.py)
-
-# --- PyTorch Device Setup ---
-def get_device():
-    """Gets the best available device (CUDA, MPS, or CPU)."""
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available(): # MPS for Apple Silicon GPUs
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    return device
-
-DEVICE = get_device()
-
-# --- Utility Functions ---
-def period_to_date(period):
-    """Converts YYYYMM integer to datetime.date object for plotting."""
-    if pd.isna(period): return None
-    try:
-        period_int = int(period)
-        year = period_int // 100
-        month = period_int % 100
-        if 1 <= month <= 12:
-            # Return as datetime object first, then extract date part
-            return datetime(year, month, 1).date()
-        else:
-            print(f"Warning: Invalid month encountered in period {period}. Skipping.")
-            return None # Invalid month
-    except (ValueError, TypeError):
-        print(f"Warning: Could not convert period '{period}' to date. Skipping.")
-        return None
+# Assuming utils.py contains get_device, SequenceDataset, period_to_date, worker_init_fn
+from utils import get_device, SequenceDataset, period_to_date, worker_init_fn
+# Assuming models.py contains the model definition
+from models import TransformerForecastingModel
+# Assuming config.py contains necessary constants
+import config
 
 # --- Loading Functions ---
 def load_pytorch_model_and_params(model_dir: Path, processed_data_dir: Path, device):
@@ -127,19 +84,18 @@ def load_pytorch_model_and_params(model_dir: Path, processed_data_dir: Path, dev
 
     return model, params, metadata
 
-def load_and_prepare_data(processed_data_dir: Path, raw_data_path: Path, metadata: dict, start_year: int = None, start_month: int = None):
-    """Loads the FULL baked data for simulation start and raw data for historical rates.
+def load_forecasting_data(processed_data_dir: Path, metadata: dict, start_year: int = None, start_month: int = None):
+    """Loads the FULL baked data for simulation start.
        Filters data based on specified start_year and start_month if provided, otherwise uses the latest period.
+       Historical rates are now loaded separately.
     """
-    print("Loading data...")
+    print("Loading data for forecasting...")
     # --- Load FULL Baked Data ---
     full_baked_path = processed_data_dir / config.FULL_DATA_FILENAME
     if not full_baked_path.exists():
          raise FileNotFoundError(f"Required full baked data file not found at {full_baked_path}. Please ensure the preprocessing script ran successfully and saved the file.")
 
     print(f"Loading FULL baked data from: {full_baked_path} (This might take time/memory)")
-    # Use specific columns if possible to reduce memory, though filtering later might require more
-    # Consider using pyarrow engine if performance is an issue
     try:
         latest_baked_df = pd.read_parquet(full_baked_path)
     except Exception as e:
@@ -194,83 +150,11 @@ def load_and_prepare_data(processed_data_dir: Path, raw_data_path: Path, metadat
     print("Released memory from the full baked dataframe.")
     # ---
 
-    # --- Load Raw Data for Historical Rates ---
-    print(f"Loading raw data for historical rates calculation from: {raw_data_path}")
-    if not raw_data_path.exists():
-        raise FileNotFoundError(f"Raw data file not found at {raw_data_path}")
+    # --- Historical Rates are loaded separately now ---
+    # Remove loading of raw data and calculation of historical_rates_df here
 
-    # Define dtypes for potentially large ID columns
-    dtype_spec = {config.GROUP_ID_COL: str} # Load group ID as string
-    # Add other known large or categorical columns if needed
-
-    raw_df = pd.read_csv(raw_data_path, dtype=dtype_spec, low_memory=False) # low_memory=False can help with mixed types
-    raw_df[config.DATE_COL] = pd.to_datetime(raw_df[config.DATE_COL])
-    raw_df['period'] = raw_df[config.DATE_COL].dt.year * 100 + raw_df[config.DATE_COL].dt.month
-
-    # Ensure 'emp_state' column exists (adjust name if different in raw CSV)
-    raw_target_col = 'emp_state' # Adjust if your raw data uses a different name
-    if raw_target_col not in raw_df.columns:
-        raise KeyError(f"Required target column '{raw_target_col}' not found in the raw data file: {raw_data_path}")
-
-    # Normalize state names from raw data (make lowercase, handle variations)
-    # Using a specific replacement map for clarity
-    state_replacements = {
-        'employed': 'employed',
-        'unemployed': 'unemployed',
-        'not in labor force': 'nilf',
-        'nilf': 'nilf'
-        # Add other variations if they exist in raw data
-    }
-    raw_df[raw_target_col] = raw_df[raw_target_col].str.lower().map(state_replacements).fillna('unknown')
-    if 'unknown' in raw_df[raw_target_col].unique():
-        print(f"Warning: Some '{raw_target_col}' entries in raw data were not mapped: {raw_df[raw_df[raw_target_col] == 'unknown'].shape[0]} rows")
-
-    # Calculate historical rates using ALL available raw data
-    # Use the state mapping from metadata for consistency (map integers back to normalized lowercase strings)
-    target_map_inverse = metadata.get('target_state_map_inverse', {0: 'employed', 1: 'unemployed', 2: 'nilf'}) # Default if missing
-    # Create the map {0: 'employed', 1: 'unemployed', 2: 'nilf'} using lowercase normalized names
-    state_map_int_to_norm_str = {k: v.lower().replace(' ', '_').replace('not_in_labor_force', 'nilf') for k, v in target_map_inverse.items()}
-    print(f"DEBUG: Using state map for historical rates: {state_map_int_to_norm_str}")
-    employed_str = state_map_int_to_norm_str.get(0, 'employed')
-    unemployed_str = state_map_int_to_norm_str.get(1, 'unemployed')
-    nilf_str = state_map_int_to_norm_str.get(2, 'nilf')
-
-    # Group by period and calculate state counts for all periods in raw_df
-    historical_counts = raw_df.groupby('period')[raw_target_col].value_counts().unstack(fill_value=0)
-
-    # Ensure all expected state columns exist after unstacking
-    for state_str in [employed_str, unemployed_str, nilf_str]:
-        if state_str not in historical_counts.columns:
-            historical_counts[state_str] = 0
-
-    # Calculate rates
-    historical_rates = pd.DataFrame(index=historical_counts.index)
-    historical_rates[employed_str] = historical_counts[employed_str]
-    historical_rates[unemployed_str] = historical_counts[unemployed_str]
-    historical_rates[nilf_str] = historical_counts[nilf_str] # Keep NILF count if needed
-
-    historical_rates['labor_force'] = historical_rates[employed_str] + historical_rates[unemployed_str]
-    # Use np.where for safe division
-    historical_rates['unemployment_rate'] = np.where(
-        historical_rates['labor_force'] > 0,
-        historical_rates[unemployed_str] / historical_rates['labor_force'],
-        0.0
-    )
-    historical_rates['date'] = historical_rates.index.map(period_to_date) # Use index (period)
-    historical_rates.reset_index(inplace=True) # Make 'period' a column
-
-    # Remove rows where date conversion failed
-    original_count = historical_rates.shape[0]
-    historical_rates.dropna(subset=['date'], inplace=True)
-    if historical_rates.shape[0] < original_count:
-        print(f"Warning: Dropped {original_count - historical_rates.shape[0]} rows from historical rates due to invalid period/date.")
-
-    print(f"Calculated historical rates for {historical_rates.shape[0]} periods (all available in raw data).")
-
-    # Return the actual start period used and the IDs active in that period
-    return initial_sim_data, historical_rates, start_period, start_period_ids
-
-# --- Forecasting Functions ---
+    # Return only the initial simulation data and start period info
+    return initial_sim_data, start_period, start_period_ids
 
 def get_sequences_for_simulation(sim_data_df: pd.DataFrame, group_col: str, seq_len: int, features: list, original_id_cols: list, pad_val: float, end_period: int):
     """
@@ -281,6 +165,7 @@ def get_sequences_for_simulation(sim_data_df: pd.DataFrame, group_col: str, seq_
     print(f"Extracting sequences and identifiers ending at period {end_period} for each individual...")
     sequences = {}
     original_identifiers = {} # Store original IDs for the last time step
+    weights = {} # Store weights for the last time step
 
     # Ensure data is sorted correctly before grouping
     # Grouping by the main ID should be sufficient if data is pre-sorted
@@ -288,6 +173,7 @@ def get_sequences_for_simulation(sim_data_df: pd.DataFrame, group_col: str, seq_
 
     valid_ids = 0
     skipped_ids = 0
+    weight_col = config.WEIGHT_COL # Get from config
 
     for person_id, person_df in tqdm(grouped, desc="Extracting Sequences"):
         # The input df is already filtered, but double-check the person was present in the end period
@@ -302,6 +188,8 @@ def get_sequences_for_simulation(sim_data_df: pd.DataFrame, group_col: str, seq_
         person_features = person_df[features].values.astype(np.float32)
         # Extract original identifiers for the *last* observation
         last_obs_identifiers = person_df.iloc[-1][original_id_cols].to_dict()
+        # Extract weight for the *last* observation
+        last_obs_weight = person_df.iloc[-1][weight_col]
 
         n_obs = person_features.shape[0]
         if n_obs == 0:
@@ -325,6 +213,7 @@ def get_sequences_for_simulation(sim_data_df: pd.DataFrame, group_col: str, seq_
         if padded_sequence.shape == (seq_len, len(features)):
             sequences[person_id] = padded_sequence
             original_identifiers[person_id] = last_obs_identifiers # Store the identifiers
+            weights[person_id] = last_obs_weight # Store the weight
             valid_ids += 1
         else:
             print(f"Warning: Final shape mismatch for {person_id}. Got {padded_sequence.shape}, expected {(seq_len, len(features))}. Skipping.")
@@ -348,7 +237,11 @@ def get_sequences_for_simulation(sim_data_df: pd.DataFrame, group_col: str, seq_
     # Ensure the DataFrame index matches the order of sequences_np
     original_identifiers_df = original_identifiers_df.reindex(ids_list)
 
-    return sequences_np, ids_list, original_identifiers_df
+    # Create a Series for weights, indexed by person_id
+    weights_series = pd.Series(weights, name=weight_col)
+    weights_series = weights_series.reindex(ids_list)
+
+    return sequences_np, ids_list, original_identifiers_df, weights_series
 
 
 def forecast_next_period_pytorch(sequences_tensor: torch.Tensor, model: nn.Module, device, metadata: dict):
@@ -404,59 +297,67 @@ def forecast_next_period_pytorch(sequences_tensor: torch.Tensor, model: nn.Modul
     return probabilities
 
 
-def sample_states_and_calc_rates(probabilities: torch.Tensor, metadata: dict):
+def sample_states_and_calc_rates(probabilities: torch.Tensor, # Shape (N, C) on GPU
+                                 weights: torch.Tensor, # Shape (N,) on GPU
+                                 metadata: dict):
     """
-    Samples states based on probabilities and calculates overall E/U rates for the sample.
+    Samples states based on probabilities and calculates WEIGHTED E/U rates for the sample.
 
     Args:
         probabilities: Tensor of shape (n_individuals, n_classes) from forecast_next_period_pytorch.
+        weights: Tensor of shape (n_individuals,) containing individual weights.
         metadata: Dictionary with metadata including target_state_map_inverse.
 
     Returns:
-        sampled_states: Tensor (CPU) with predicted state indices (shape: n_individuals).
-        overall_unemp_rate: Unemployment rate across all individuals in this sample.
-        overall_emp_rate: Employment rate (E / LF) across all individuals in this sample.
+        sampled_states: Tensor (GPU) with predicted state indices (shape: n_individuals).
+        weighted_unemp_rate: Weighted unemployment rate across all individuals in this sample.
+        weighted_emp_rate: Weighted employment rate (E / LF) across all individuals in this sample.
     """
     n_individuals = probabilities.shape[0]
     target_map_inverse = metadata.get('target_state_map_inverse', {})
 
     # --- Find integer indices for Employed and Unemployed states ---
-    # Handle potential case differences or naming variations
     try:
         employed_int = next(k for k, v in target_map_inverse.items() if v.lower() == 'employed')
         unemployed_int = next(k for k, v in target_map_inverse.items() if v.lower() == 'unemployed')
     except StopIteration:
-        print("ERROR: Could not find 'employed' or 'unemployed' state in target_state_map_inverse:", target_map_inverse)
-        # Fallback or raise error - let's raise for clarity
         raise ValueError("Metadata missing required state definitions ('employed', 'unemployed') in target_state_map_inverse")
 
     # Sample states based on probabilities (on the device probabilities are on)
-    # multinomial expects probabilities, not logits
     sampled_states_gpu = torch.multinomial(probabilities, num_samples=1).squeeze(1)
 
-    # Move to CPU for numpy operations
-    sampled_states_np = sampled_states_gpu.cpu().numpy()
+    # Calculate WEIGHTED unemployment and employment rates for this specific sample
+    employed_mask = (sampled_states_gpu == employed_int)
+    unemployed_mask = (sampled_states_gpu == unemployed_int)
 
-    # Calculate overall unemployment and employment rates for this specific sample
-    employed_count = np.sum(sampled_states_np == employed_int)
-    unemployed_count = np.sum(sampled_states_np == unemployed_int)
-    labor_force = employed_count + unemployed_count
+    employed_weight_sum = torch.sum(weights[employed_mask])
+    unemployed_weight_sum = torch.sum(weights[unemployed_mask])
+    labor_force_weight_sum = employed_weight_sum + unemployed_weight_sum
 
-    overall_unemp_rate = np.divide(unemployed_count, labor_force, out=np.zeros_like(unemployed_count, dtype=float), where=labor_force>0)
-    overall_emp_rate = np.divide(employed_count, labor_force, out=np.zeros_like(employed_count, dtype=float), where=labor_force>0) # E / LF
+    # Avoid division by zero
+    if labor_force_weight_sum > 0:
+        weighted_unemp_rate = unemployed_weight_sum / labor_force_weight_sum
+        weighted_emp_rate = employed_weight_sum / labor_force_weight_sum # E / LF
+    else:
+        weighted_unemp_rate = torch.tensor(0.0, device=probabilities.device)
+        weighted_emp_rate = torch.tensor(0.0, device=probabilities.device)
 
-    return sampled_states_gpu, float(overall_unemp_rate), float(overall_emp_rate)
+    return sampled_states_gpu, weighted_unemp_rate.item(), weighted_emp_rate.item() # Return rates as floats
 
 
 def calculate_group_rates(sampled_states_np: np.ndarray, # Shape (n_individuals,) on CPU
                           grouping_series: pd.Series, # Series with group IDs (statefip or ind_group_cat), index matching sampled_states
+                          weights_series: pd.Series, # Series with weights, index matching sampled_states
                           target_map_inverse: dict):
-    """Calculates unemployment and employment rates for each group."""
+    """Calculates WEIGHTED unemployment and employment rates for each group."""
     if grouping_series is None or grouping_series.empty:
         print("Warning: Grouping series is empty, cannot calculate group rates.")
         return {}
-    if len(sampled_states_np) != len(grouping_series):
-        print(f"Warning: Length mismatch between states ({len(sampled_states_np)}) and group IDs ({len(grouping_series)}). Cannot calculate group rates.")
+    if weights_series is None or weights_series.empty:
+        print("Warning: Weights series is empty, cannot calculate weighted group rates.")
+        return {}
+    if len(sampled_states_np) != len(grouping_series) or len(sampled_states_np) != len(weights_series):
+        print(f"Warning: Length mismatch between states ({len(sampled_states_np)}), group IDs ({len(grouping_series)}), or weights ({len(weights_series)}). Cannot calculate group rates.")
         return {}
 
     # --- Find integer indices for Employed and Unemployed states ---
@@ -469,28 +370,25 @@ def calculate_group_rates(sampled_states_np: np.ndarray, # Shape (n_individuals,
     # Create a DataFrame for calculation
     df = pd.DataFrame({
         'group': grouping_series.values, # Use .values to ensure alignment if index is different
-        'state': sampled_states_np
+        'state': sampled_states_np,
+        'weight': weights_series.values
     })
 
-    # Count states within each group
-    # Use Categorical for potential performance improvement and handling all states
-    state_categories = list(target_map_inverse.keys())
-    df['state'] = pd.Categorical(df['state'], categories=state_categories)
-    counts = df.groupby('group')['state'].value_counts().unstack(fill_value=0) # observed=False includes all categories
+    # Calculate weighted counts for each state within each group
+    df['is_employed'] = (df['state'] == employed_int)
+    df['is_unemployed'] = (df['state'] == unemployed_int)
 
-    # Ensure all required state columns exist, even if count is 0
-    for state_int in [employed_int, unemployed_int]:
-        if state_int not in counts.columns:
-            counts[state_int] = 0
+    group_weights = df.groupby('group').agg(
+        employed_weight=('weight', lambda x: x[df.loc[x.index, 'is_employed']].sum()),
+        unemployed_weight=('weight', lambda x: x[df.loc[x.index, 'is_unemployed']].sum())
+    )
 
     # Calculate rates
-    employed_count = counts[employed_int]
-    unemployed_count = counts[unemployed_int]
-    labor_force = employed_count + unemployed_count
+    labor_force_weight = group_weights['employed_weight'] + group_weights['unemployed_weight']
 
-    rates_df = pd.DataFrame(index=counts.index)
-    rates_df['unemp_rate'] = np.where(labor_force > 0, unemployed_count / labor_force, 0.0)
-    rates_df['emp_rate'] = np.where(labor_force > 0, employed_count / labor_force, 0.0) # Emp / LF
+    rates_df = pd.DataFrame(index=group_weights.index)
+    rates_df['unemp_rate'] = np.where(labor_force_weight > 0, group_weights['unemployed_weight'] / labor_force_weight, 0.0)
+    rates_df['emp_rate'] = np.where(labor_force_weight > 0, group_weights['employed_weight'] / labor_force_weight, 0.0) # Emp / LF
 
     # Convert to dictionary: {group_id: {'unemp_rate': x, 'emp_rate': y}}
     return rates_df.to_dict(orient='index')
@@ -769,17 +667,20 @@ def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shap
 
 def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # Shape: (N, S, F), on DEVICE
                                       initial_identifiers_df: pd.DataFrame, # CPU DataFrame
+                                      initial_weights_series: pd.Series, # CPU Series
                                       model: nn.Module, # On DEVICE
                                       device,
                                       metadata: dict,
                                       params: dict,
                                       initial_period: int, # Starting period YYYYMM
                                       periods_to_forecast: int = 12,
-                                      n_samples: int = 100):
+                                      n_samples: int = 1, # Default to 1 for HPT objective, >1 for full forecast
+                                      return_raw_samples: bool = False # Control returning raw sample data
+                                      ):
     """
     Runs the multi-period forecast simulation, processing one sample fully at a time
     to conserve memory. Calculates and uses group-specific rates dynamically.
-    Returns both aggregated forecast statistics and raw sample trajectories for unemployment rate.
+    Returns aggregated forecast statistics (median, CI) and optionally raw sample trajectories.
     """
     print(f"\nStarting multi-period forecast:")
     print(f" - Initial Period: {initial_period}")
@@ -794,6 +695,8 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
     n_individuals, seq_len, n_features = initial_sequences_tensor.shape
     # Keep identifiers constant across samples and time (assuming they don't change)
     current_identifiers_df = initial_identifiers_df.copy() # Use a copy
+    # Move initial weights to GPU tensor for calculations
+    current_weights_gpu = torch.from_numpy(initial_weights_series.values.astype(np.float32)).to(device)
 
     # --- Get metadata/params needed within the loop ---
     feature_names = metadata.get('feature_names', [])
@@ -817,7 +720,7 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
 
 
     # --- Outer loop: Iterate through each Monte Carlo sample ---
-    for s in tqdm(range(n_samples), desc="Processing Samples"):
+    for s in tqdm(range(n_samples), desc="Processing Samples", disable=(n_samples <= 1)):
         sample_period_urs = [] # Store overall UR for each period within this sample
 
         # Initialize sequence tensor for this sample by cloning the initial state
@@ -844,25 +747,25 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
                 current_sample_sequences_gpu, model, device, metadata
             )
 
-            # 2. Sample states and calculate OVERALL rates for this sample step
-            sampled_states_gpu, overall_sample_unemp_rate, overall_sample_emp_rate = sample_states_and_calc_rates(
-                 probabilities_gpu, metadata
+            # 2. Sample states and calculate WEIGHTED OVERALL rates for this sample step
+            sampled_states_gpu, weighted_overall_unemp_rate, weighted_overall_emp_rate = sample_states_and_calc_rates(
+                 probabilities_gpu, current_weights_gpu, metadata
             )
-            # Store the overall UR for this period and sample
-            sample_period_urs.append(overall_sample_unemp_rate)
+            # Store the weighted overall UR for this period and sample
+            sample_period_urs.append(weighted_overall_unemp_rate)
 
-            # 3. Calculate Group-Specific Rates (State, Industry) for this sample step
+            # 3. Calculate WEIGHTED Group-Specific Rates (State, Industry) for this sample step
             sampled_states_np = sampled_states_gpu.cpu().numpy() # Needs CPU numpy array
             state_rates_dict = {}
             industry_rates_dict = {}
             # Only calculate if the corresponding identifier column exists
             if state_col and state_col in current_identifiers_df.columns:
                 state_rates_dict = calculate_group_rates(
-                    sampled_states_np, current_identifiers_df[state_col], target_map_inverse
+                    sampled_states_np, current_identifiers_df[state_col], initial_weights_series, target_map_inverse
                 )
             if ind_col and ind_col in current_identifiers_df.columns:
                  industry_rates_dict = calculate_group_rates(
-                    sampled_states_np, current_identifiers_df[ind_col], target_map_inverse
+                    sampled_states_np, current_identifiers_df[ind_col], initial_weights_series, target_map_inverse
                 )
 
             # 4. Update this sample's sequences using its sampled states and calculated rates
@@ -875,8 +778,8 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
                 current_sim_period,             # The period *before* the prediction
                 state_rates_dict,               # Pass calculated state rates (CPU dict)
                 industry_rates_dict,            # Pass calculated industry rates (CPU dict)
-                overall_sample_unemp_rate,      # Pass overall rate for national features
-                overall_sample_emp_rate,        # Pass overall rate for national features
+                weighted_overall_unemp_rate,    # Pass weighted overall rate for national features
+                weighted_overall_emp_rate,      # Pass weighted overall rate for national features
                 feature_indices                 # Pass pre-calculated indices
             )
             # updated tensor remains on GPU for the next iteration
@@ -921,8 +824,9 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
     # Rows = samples, Columns = forecast periods
     if not all_samples_period_urs:
         print("Warning: No sample results were collected. Cannot aggregate.")
-        empty_df = pd.DataFrame(columns=['period', 'date', 'unemployment_rate_median', 'unemployment_rate_p10', 'unemployment_rate_p90'])
-        return empty_df, pd.DataFrame() # Return empty dataframes
+        empty_agg_df = pd.DataFrame(columns=['period', 'date', 'unemployment_rate_median', 'unemployment_rate_p10', 'unemployment_rate_p90'])
+        empty_raw_df = pd.DataFrame()
+        return empty_agg_df, empty_raw_df # Return empty dataframes
 
     sample_urs_over_time = pd.DataFrame(all_samples_period_urs, columns=forecast_periods_list)
 
@@ -940,12 +844,16 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
     forecast_agg_df.dropna(subset=['date'], inplace=True)
 
     print("Multi-period forecast complete.")
-    # Return both aggregated results and raw sample UR data
-    return forecast_agg_df, sample_urs_over_time
+    # Return aggregated results and optionally raw sample UR data
+    if return_raw_samples:
+        return forecast_agg_df, sample_urs_over_time
+    else:
+        # Return aggregated results and an empty DataFrame for raw samples
+        return forecast_agg_df, pd.DataFrame()
 
 
 # --- Plotting Function ---
-def plot_unemployment_forecast_py(historical_df: pd.DataFrame,
+def plot_unemployment_forecast_py(national_rates_file: Path, # Changed input
                                   forecast_agg_df: pd.DataFrame, # Aggregated (median, p10, p90)
                                   sample_urs_over_time: pd.DataFrame, # Raw sample UR data (Samples x Periods)
                                   output_path: Path,
@@ -953,18 +861,33 @@ def plot_unemployment_forecast_py(historical_df: pd.DataFrame,
     """Plots historical and forecasted unemployment rates, showing individual sample trajectories, median, and 80% CI."""
     print("Creating forecast visualization...")
 
-    if historical_df.empty:
-        print("Warning: Historical data is empty. Plotting forecast only.")
+    # --- Load Historical National Rates ---
+    historical_df = pd.DataFrame() # Initialize empty
+    if national_rates_file.exists():
+        try:
+            historical_df = pd.read_csv(national_rates_file)
+            # Ensure correct column names and types
+            if 'date' not in historical_df.columns or 'national_unemp_rate' not in historical_df.columns:
+                 raise ValueError("National rates file missing required columns: 'date', 'national_unemp_rate'")
+            historical_df['date'] = pd.to_datetime(historical_df['date'])
+            # Rename column for consistency with plotting code below
+            historical_df.rename(columns={'national_unemp_rate': 'unemployment_rate'}, inplace=True)
+            historical_df = historical_df.dropna(subset=['date', 'unemployment_rate']).sort_values('date')
+            print(f"Loaded historical national rates from: {national_rates_file}")
+        except Exception as e:
+            print(f"Warning: Failed to load or process historical rates from {national_rates_file}: {e}. Plotting forecast only.")
+            historical_df = pd.DataFrame() # Reset on error
+    else:
+        print(f"Warning: Historical national rates file not found at {national_rates_file}. Plotting forecast only.")
+
     if forecast_agg_df.empty:
         print("Warning: Aggregated forecast data is empty. Cannot plot forecast.")
         return
-    if sample_urs_over_time.empty:
-        print("Warning: Raw sample data is empty. Plotting aggregated forecast only.")
+    # Allow plotting even if raw samples are empty (e.g., if return_raw_samples=False)
+    plot_samples = not sample_urs_over_time.empty
 
     # Ensure date columns are valid datetime objects
-    if not historical_df.empty:
-        historical_df['date'] = pd.to_datetime(historical_df['date']) # Already done in loading? Ensure it.
-        historical_df = historical_df.dropna(subset=['date', 'unemployment_rate']).sort_values('date')
+    # historical_df date conversion done above
     forecast_agg_df['date'] = pd.to_datetime(forecast_agg_df['date']) # Already done? Ensure it.
     forecast_agg_df = forecast_agg_df.dropna(subset=['date', 'unemployment_rate_median', 'unemployment_rate_p10', 'unemployment_rate_p90']).sort_values('date')
 
@@ -1000,7 +923,7 @@ def plot_unemployment_forecast_py(historical_df: pd.DataFrame,
     plot_forecast_median = forecast_median
     plot_forecast_p10 = forecast_p10
     plot_forecast_p90 = forecast_p90
-    plot_sample_urs = sample_urs_over_time
+    plot_sample_urs_df = sample_urs_over_time # Use original if plotting samples
 
     if last_hist_date is not None and last_hist_rate is not None and not forecast_agg_df.empty:
         # Ensure the first forecast date is immediately after the last historical date
@@ -1011,28 +934,31 @@ def plot_unemployment_forecast_py(historical_df: pd.DataFrame,
             plot_forecast_p10 = np.insert(forecast_p10, 0, last_hist_rate) # Start CI from last known point
             plot_forecast_p90 = np.insert(forecast_p90, 0, last_hist_rate) # Start CI from last known point
 
-            # Also adjust sample trajectories if they exist
-            if not sample_urs_over_time.empty:
+            # Also adjust sample trajectories if they exist and are being plotted
+            if plot_samples:
                 # Create a temporary DataFrame for plotting samples
-                plot_sample_urs = sample_urs_over_time.copy()
+                plot_sample_urs_df = sample_urs_over_time.copy()
                 # Add the last historical rate as the first column, using the last historical date as the column name
-                plot_sample_urs.insert(0, last_hist_date, last_hist_rate)
+                # Convert date to a suitable column name (e.g., string) if necessary
+                last_hist_date_col = last_hist_date # pd.Timestamp works as column name
+                plot_sample_urs_df.insert(0, last_hist_date_col, last_hist_rate)
 
 
-    # Plot individual sample trajectories (if available) using potentially adjusted data
-    if not plot_sample_urs.empty:
-        n_samples_to_plot = plot_sample_urs.shape[0]
+    # Plot individual sample trajectories (if available and requested) using potentially adjusted data
+    sample_plot_dates = None # Initialize
+    if plot_samples:
+        n_samples_to_plot = plot_sample_urs_df.shape[0]
         # Use the adjusted dates and sample data
-        sample_plot_dates = plot_forecast_dates if 'plot_forecast_dates' in locals() and plot_forecast_dates.size == plot_sample_urs.shape[1] else None
-
-        if sample_plot_dates is not None:
+        # Ensure the number of date points matches the number of columns in the sample data
+        if plot_forecast_dates.size == plot_sample_urs_df.shape[1]:
+            sample_plot_dates = plot_forecast_dates
             for i in range(n_samples_to_plot):
-                ax.plot(sample_plot_dates, plot_sample_urs.iloc[i].values,
-                        color='lightsteelblue', alpha=0.15, linewidth=0.5, zorder=1) # Low alpha, thin lines
+                ax.plot(sample_plot_dates, plot_sample_urs_df.iloc[i].values,
+                        color='steelblue', alpha=0.25, linewidth=0.6, zorder=1) # Darker color, slightly higher alpha/linewidth
             # Add a label for the samples collection only once (won't appear in legend by default)
-            ax.plot([], [], color='lightsteelblue', alpha=0.4, linewidth=1, label='Sample Trajectories') # Dummy plot for legend
+            ax.plot([], [], color='steelblue', alpha=0.5, linewidth=1, label='Sample Trajectories') # Dummy plot for legend
         else:
-            print("Warning: Mismatch between number of forecast dates and sample data columns after adjustment. Skipping sample trajectory plotting.")
+            print(f"Warning: Mismatch between number of forecast dates ({plot_forecast_dates.size}) and sample data columns ({plot_sample_urs_df.shape[1]}) after adjustment. Skipping sample trajectory plotting.")
 
 
     # Plot confidence interval (P10-P90) - light shading using potentially adjusted data
@@ -1050,9 +976,9 @@ def plot_unemployment_forecast_py(historical_df: pd.DataFrame,
     unemployed_label = target_map_inverse.get(next((k for k, v in target_map_inverse.items() if v.lower() == 'unemployed'), 1), 'Unemployed')
 
     # Formatting
-    ax.set_title(f'{unemployed_label} Rate Forecast (Transformer Model)', fontsize=16, fontweight='bold')
+    ax.set_title('Unemployment Rate Forecast (Transformer Model)', fontsize=16, fontweight='bold') # Updated Title
     ax.set_xlabel('Date', fontsize=12)
-    ax.set_ylabel(f'{unemployed_label} Rate', fontsize=12)
+    ax.set_ylabel('Unemployment Rate', fontsize=12) # Updated Label
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1%}')) # Format as percentage
 
     # Improve date axis formatting
@@ -1068,7 +994,7 @@ def plot_unemployment_forecast_py(historical_df: pd.DataFrame,
     filtered_handles = [h for h, l in zip(handles, labels) if l in ['Historical (Recent)', 'Forecast (Median)', 'Forecast (80% CI)']]
     filtered_labels = [l for l in labels if l in ['Historical (Recent)', 'Forecast (Median)', 'Forecast (80% CI)']]
     # Check if sample trajectories were plotted using the adjusted data check
-    if not plot_sample_urs.empty and 'sample_plot_dates' in locals() and sample_plot_dates is not None:
+    if plot_samples and sample_plot_dates is not None:
          # Add the dummy 'Sample Trajectories' label if plotted
          sample_handle = next((h for h, l in zip(handles, labels) if l == 'Sample Trajectories'), None)
          if sample_handle:
@@ -1090,192 +1016,266 @@ def plot_unemployment_forecast_py(historical_df: pd.DataFrame,
         print(f"Error saving plot: {e}")
     plt.close(fig) # Close the figure to free memory
 
+# --- HPT Objective Specific Functions ---
 
-# --- Main Execution ---
-def main():
-    script_start_time = time.time()
-    print("=" * 60)
-    print(" Starting Transformer Unemployment Forecast Script (PyTorch) ")
-    print(f" Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ")
-    print(" Using parameters from config.py ")
-    print("=" * 60)
+def calculate_hpt_forecast_metrics(model: nn.Module,
+                                hpt_val_baked_data: pd.DataFrame, # Still needed to get start periods/sequences
+                                national_rates_file: Path, # Path to the truth data
+                                metadata: dict,
+                                params: dict,
+                                device,
+                                # num_forecasts: int = 3, # Number of forecasts determined by intervals
+                                forecast_horizon: int = 12): # Months to forecast
+    """
+    Calculates the HPT objective: RMSE of aggregate unemployment rate over multiple recursive forecasts,
+    using the pre-calculated national rates file as truth. Forecasts start at the beginning of each
+    interval defined in metadata['hpt_validation_intervals'].
+    """
+    print("\n===== Calculating HPT Metric (Forecast RMSE vs National Rates File) =====")
+    if hpt_val_baked_data is None or hpt_val_baked_data.empty:
+        print("HPT validation baked data is empty. Cannot select start periods.")
+        return {'rmse': float('inf'), 'variance': float('inf')}
+    if not national_rates_file.exists():
+        print(f"ERROR: National rates file not found at {national_rates_file}. Cannot calculate HPT forecast RMSE.")
+        return {'rmse': float('inf'), 'variance': float('inf')}
+    if 'hpt_validation_intervals' not in metadata or not metadata['hpt_validation_intervals']:
+        print("ERROR: 'hpt_validation_intervals' not found or empty in metadata. Cannot determine forecast start periods.")
+        return {'rmse': float('inf'), 'variance': float('inf')}
 
-    # --- Paths --- Use config paths
-    project_root = config.PROJECT_ROOT
-    # Point to the specific standard run directory containing the model artifacts
-    model_dir = config.TRAIN_OUTPUT_SUBDIR / "standard_run" # Assumes model saved here
-    processed_data_dir = config.PREPROCESS_OUTPUT_DIR
-    raw_data_path = config.FORECAST_RAW_DATA_FILE
-    output_dir = config.FORECAST_OUTPUT_SUBDIR
-    output_dir.mkdir(parents=True, exist_ok=True)
-    plot_path = output_dir / "transformer_unemployment_forecast_py.png"
-    forecast_csv_path = output_dir / "transformer_forecast_results_py.csv"
-    raw_samples_csv_path = output_dir / "transformer_forecast_raw_samples_ur_py.csv" # Optional save
+    model.eval() # Ensure model is in eval mode
+    all_forecast_errors = [] # Store (predicted_rate - actual_rate) for each month across all forecasts
 
-    print(f"Project Root: {project_root}")
-    print(f"Model Directory: {model_dir}")
-    print(f"Processed Data Directory: {processed_data_dir}")
-    print(f"Raw Data Path (for historical): {raw_data_path}")
-    print(f"Output Directory: {output_dir}")
+    # --- Load Actual National Rates ---
+    try:
+        actual_rates_df = pd.read_csv(national_rates_file)
+        if 'date' not in actual_rates_df.columns or 'national_unemp_rate' not in actual_rates_df.columns:
+            raise ValueError("National rates file missing required columns: 'date', 'national_unemp_rate'")
+        actual_rates_df['date'] = pd.to_datetime(actual_rates_df['date'])
+        # Calculate period column for merging
+        actual_rates_df['period'] = actual_rates_df['date'].dt.year * 100 + actual_rates_df['date'].dt.month
+        actual_rates_df.rename(columns={'national_unemp_rate': 'actual_unemployment_rate'}, inplace=True)
+        actual_rates_df = actual_rates_df[['period', 'actual_unemployment_rate']].dropna()
+        print(f"Loaded actual national rates from {national_rates_file} for {len(actual_rates_df)} periods.")
+        if actual_rates_df.empty:
+            print("Warning: Loaded actual rates data is empty.")
+            return {'rmse': float('inf'), 'variance': float('inf')}
+    except Exception as e:
+        print(f"Error loading or processing actual rates file {national_rates_file}: {e}")
+        return {'rmse': float('inf'), 'variance': float('inf')}
 
-    # Print device info
-    device_name = "Unknown"
-    if DEVICE.type == 'cuda':
+    # --- Determine Start Periods from HPT Intervals in Metadata ---
+    hpt_intervals = metadata['hpt_validation_intervals']
+    start_periods = []
+    max_actual_period = actual_rates_df['period'].max() if not actual_rates_df.empty else -1
+
+    # Convert interval strings to datetime and get start periods
+    try:
+        for start_str, end_str in hpt_intervals:
+            start_dt = pd.to_datetime(start_str)
+            # end_dt = pd.to_datetime(end_str) # End date not directly needed for start period
+            potential_start_period = start_dt.year * 100 + start_dt.month
+
+            # Check if enough future data exists in actual_rates_df for this start period
+            required_end_period = potential_start_period
+            valid_horizon = True
+            for _ in range(forecast_horizon):
+                 yr, mn = required_end_period // 100, required_end_period % 100
+                 if mn == 12: required_end_period = (yr + 1) * 100 + 1
+                 else: required_end_period += 1
+                 # Check if the *next* period exists in actuals
+                 if required_end_period not in actual_rates_df['period'].values:
+                     valid_horizon = False
+                     break
+
+            if valid_horizon:
+                 start_periods.append(potential_start_period)
+            else:
+                 print(f"Skipping potential start period {potential_start_period} (from interval {start_str}-{end_str}): Not enough future data ({forecast_horizon} months) available in actual rates file (max period with data: {max_actual_period}).")
+
+    except Exception as e:
+        print(f"ERROR processing HPT intervals from metadata: {e}")
+        return {'rmse': float('inf'), 'variance': float('inf')}
+
+    if not start_periods:
+        print("ERROR: No valid start periods found based on HPT intervals and available actual rates data.")
+        return {'rmse': float('inf'), 'variance': float('inf')}
+
+    print(f"Selected start periods for HPT forecast evaluation based on metadata intervals: {start_periods}")
+    num_forecasts = len(start_periods) # Number of forecasts is now determined by valid intervals
+
+    # --- Run Forecasts for Each Start Period ---
+    seq_len = params['sequence_length']
+    group_col = config.GROUP_ID_COL
+    features = metadata['feature_names']
+    original_id_cols = metadata['original_identifier_columns']
+    pad_val = metadata['pad_value']
+
+    # Ensure period column exists in hpt_val_baked_data for filtering
+    if 'period' not in hpt_val_baked_data.columns:
+        hpt_val_baked_data['period'] = pd.to_datetime(hpt_val_baked_data[config.DATE_COL]).dt.year * 100 + pd.to_datetime(hpt_val_baked_data[config.DATE_COL]).dt.month
+
+    for start_period in start_periods:
+        print(f"\n--- Running HPT forecast starting from {start_period} ---")
         try:
-            device_name = f"CUDA/GPU ({torch.cuda.get_device_name(DEVICE)})"
-        except Exception:
-            device_name = "CUDA/GPU (Name N/A)"
-    elif DEVICE.type == 'mps':
-        device_name = "Apple Silicon GPU (MPS)"
-    elif DEVICE.type == 'cpu':
-        device_name = "CPU"
-    print(f"Using device: {device_name}")
+            # 1. Filter HPT data up to the start period for individuals present then
+            start_period_ids = hpt_val_baked_data[hpt_val_baked_data['period'] == start_period][group_col].unique()
+            if len(start_period_ids) == 0:
+                print(f"Warning: No individuals found in HPT data for start period {start_period}. Skipping forecast.")
+                continue
+            initial_sim_data_hpt = hpt_val_baked_data[
+                (hpt_val_baked_data[group_col].isin(start_period_ids)) &
+                (hpt_val_baked_data['period'] <= start_period)
+            ].sort_values([group_col, config.DATE_COL])
 
-    # --- Load Model and Data ---
-    print("\n--- Loading Model and Data ---")
+            # 2. Extract initial sequences, identifiers, and weights
+            initial_sequences_np, _, initial_identifiers_df, initial_weights_series = get_sequences_for_simulation(
+                sim_data_df=initial_sim_data_hpt,
+                group_col=group_col,
+                seq_len=seq_len,
+                features=features,
+                original_id_cols=original_id_cols,
+                pad_val=pad_val,
+                end_period=start_period
+            )
+            initial_sequences_tensor = torch.from_numpy(initial_sequences_np).to(device)
+
+            # 3. Run the recursive forecast (using n_samples=1 for HPT objective)
+            forecast_agg_df, _ = forecast_multiple_periods_pytorch(
+                initial_sequences_tensor=initial_sequences_tensor,
+                initial_identifiers_df=initial_identifiers_df,
+                initial_weights_series=initial_weights_series,
+                model=model,
+                device=device,
+                metadata=metadata,
+                params=params,
+                initial_period=start_period,
+                periods_to_forecast=forecast_horizon,
+                n_samples=1, # Only need one sample path (median effectively) for RMSE calculation
+                return_raw_samples=False
+            )
+
+            if forecast_agg_df.empty:
+                print(f"Warning: Forecast from start period {start_period} returned empty results.")
+                continue
+
+            # 4. Merge with actual rates (loaded from file) and calculate errors
+            comparison_df = pd.merge(
+                forecast_agg_df[['period', 'unemployment_rate_median']],
+                actual_rates_df, # Use the dataframe loaded from national_rates_file
+                on='period',
+                how='inner' # Only compare months where both forecast and actual exist
+            )
+
+            if len(comparison_df) != forecast_horizon:
+                 print(f"Warning: Forecast from {start_period} - Expected {forecast_horizon} comparison months, found {len(comparison_df)}. Check actual data availability in national rates file.")
+
+            if not comparison_df.empty:
+                # --- Added Diagnostic Printing ---
+                print(f"  Comparison Data (Forecast vs Actual) for start_period {start_period}:")
+                print(comparison_df.to_string(index=False, float_format="%.6f"))
+                # --- End Added Diagnostic Printing ---
+
+                errors = comparison_df['unemployment_rate_median'] - comparison_df['actual_unemployment_rate']
+                all_forecast_errors.extend(errors.tolist())
+                run_rmse = np.sqrt(mean_squared_error(comparison_df['actual_unemployment_rate'], comparison_df['unemployment_rate_median']))
+                print(f"  -> Forecast run from {start_period} completed. RMSE for this run: {run_rmse:.6f}")
+            else:
+                 print(f"  -> Forecast run from {start_period} - No matching actual data found for comparison in national rates file.")
+
+            # Clean up memory
+            del initial_sequences_tensor, initial_identifiers_df, initial_weights_series, forecast_agg_df, comparison_df, initial_sim_data_hpt
+            if device.type == 'cuda': torch.cuda.empty_cache()
+            elif device.type == 'mps': torch.mps.empty_cache()
+            gc.collect()
+
+        except Exception as e:
+            print(f"ERROR during HPT forecast run starting from {start_period}: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continue to next start period if possible, but the final RMSE might be unreliable
+
+    # --- Calculate Final RMSE ---
+    if not all_forecast_errors:
+        print("ERROR: No forecast errors collected across all runs. Cannot calculate final RMSE.")
+        return {'rmse': float('inf'), 'variance': float('inf')}
+
+    final_rmse = np.sqrt(np.mean(np.square(all_forecast_errors)))
+    final_variance = np.var(all_forecast_errors)
+    print(f"\nCalculated Final HPT Metrics (RMSE and Variance over {len(all_forecast_errors)} months across {num_forecasts} forecasts):")
+    print(f"  RMSE: {final_rmse:.6f}")
+    print(f"  Variance: {final_variance:.6f}")
+
+    return {'rmse': final_rmse, 'variance': final_variance}
+
+# --- Standard Evaluation Function (from training script) ---
+def evaluate_aggregate_unemployment_error(model, dataloader, device, metadata):
+    """
+    Evaluates the model based on the *weighted* aggregate unemployment rate error
+    using a standard DataLoader (typically for the validation set during training).
+    """
+    # Define class indices based on common convention (adjust if metadata differs)
+    target_map_inverse = metadata.get('target_state_map_inverse', {})
     try:
-        model, params, metadata = load_pytorch_model_and_params(model_dir, processed_data_dir, DEVICE)
-        # Load data, potentially specifying start date from config
-        initial_sim_data_df, historical_rates_df, simulation_start_period, _ = load_and_prepare_data(
-            processed_data_dir, raw_data_path, metadata, config.FORECAST_START_YEAR, config.FORECAST_START_MONTH
-        )
-        print(f"Data loaded. Simulation will start from period: {simulation_start_period}")
-    except (FileNotFoundError, ValueError, KeyError, Exception) as e:
-        print(f"\nERROR: Failed during model or data loading.")
-        print(f"Details: {e}")
-        import traceback
-        traceback.print_exc()
-        return # Stop execution
-
-    # --- Prepare Initial Sequences ---
-    print("\n--- Preparing Initial Sequences for Simulation ---")
-    try:
-        sequence_length = params['sequence_length']
-        initial_sequences_np, sim_ids, initial_identifiers_df = get_sequences_for_simulation(
-            sim_data_df=initial_sim_data_df,
-            group_col=config.GROUP_ID_COL,
-            seq_len=sequence_length,
-            features=metadata['feature_names'],
-            original_id_cols=metadata['original_identifier_columns'],
-            pad_val=metadata['pad_value'],
-            end_period=simulation_start_period
-        )
-        # Convert initial sequences to Tensor and move to device
-        initial_sequences_tensor = torch.from_numpy(initial_sequences_np).to(DEVICE)
-        print(f"Initial sequences prepared. Shape: {initial_sequences_tensor.shape}")
-        print(f"Initial identifiers prepared. Shape: {initial_identifiers_df.shape}")
-
-        # --- Explicitly delete large intermediate dataframes ---
-        del initial_sim_data_df
-        del initial_sequences_np
-        gc.collect()
-        print("Cleaned up intermediate dataframes from memory.")
-
-    except (ValueError, KeyError, Exception) as e:
-        print(f"\nERROR: Failed preparing initial sequences.")
-        print(f"Details: {e}")
-        import traceback
-        traceback.print_exc()
-        return # Stop execution
-
-    # --- Run Forecast ---
-    print("\n--- Running Multi-Period Forecast Simulation ---")
-    try:
-        # Capture both aggregated forecast and raw sample data
-        forecast_agg_df, sample_urs_over_time = forecast_multiple_periods_pytorch(
-            initial_sequences_tensor=initial_sequences_tensor,
-            initial_identifiers_df=initial_identifiers_df,
-            model=model,
-            device=DEVICE,
-            metadata=metadata,
-            params=params, # Pass params if needed inside, e.g. seq_len (though already used)
-            initial_period=simulation_start_period,
-            periods_to_forecast=config.FORECAST_PERIODS,
-            n_samples=config.MC_SAMPLES
-        )
-    except (ValueError, KeyError, RuntimeError, Exception) as e:
-        print(f"\nERROR: An error occurred during the forecasting simulation.")
-        print(f"Details: {e}")
-        import traceback
-        traceback.print_exc()
-        # Attempt to save whatever results might exist before exiting
-        if 'forecast_agg_df' in locals() and not forecast_agg_df.empty:
-            forecast_agg_df.to_csv(output_dir / "transformer_forecast_PARTIAL_RESULTS_py.csv", index=False)
-            print("Attempted to save partial aggregated results.")
-        if 'sample_urs_over_time' in locals() and not sample_urs_over_time.empty:
-            sample_urs_over_time.to_csv(output_dir / "transformer_forecast_PARTIAL_RAW_SAMPLES_py.csv")
-            print("Attempted to save partial raw sample results.")
-        return # Stop execution
-
-    # --- Save & Plot Results ---
-    print("\n--- Saving Forecast Results and Generating Plot ---")
-    try:
-        if not forecast_agg_df.empty:
-            forecast_agg_df.to_csv(forecast_csv_path, index=False)
-            print(f"Aggregated forecast results saved to: {forecast_csv_path}")
-        else:
-            print("Skipping aggregated results saving (dataframe is empty).")
-
-        # Optionally save raw sample UR data
-        if config.SAVE_RAW_SAMPLES and not sample_urs_over_time.empty:
-            # Use original column names (periods) for saving raw data
-            sample_urs_over_time.to_csv(raw_samples_csv_path)
-            print(f"Raw sample unemployment rates saved to: {raw_samples_csv_path}")
-
-    except Exception as e:
-        print(f"Warning: Error saving forecast results CSV: {e}")
-
-    try:
-         # Pass the original raw sample data to the plotting function
-         # The plotting function will handle prepending the historical point internally
-        plot_unemployment_forecast_py(
-            historical_rates_df,
-            forecast_agg_df,
-            sample_urs_over_time, # Pass the original raw samples
-            plot_path,
-            metadata
-        )
-    except Exception as e:
-        print(f"Warning: Error generating plot: {e}")
-        import traceback
-        traceback.print_exc()
+        employed_idx = next(k for k, v in target_map_inverse.items() if v.lower() == 'employed')
+        unemployed_idx = next(k for k, v in target_map_inverse.items() if v.lower() == 'unemployed')
+        inactive_idx = next(k for k, v in target_map_inverse.items() if v.lower().replace(' ', '_') == 'not_in_labor_force' or v.lower() == 'nilf')
+    except StopIteration:
+        raise ValueError("Metadata missing required state definitions ('employed', 'unemployed', 'nilf'/'not in labor force') for aggregate error evaluation")
 
 
-    # --- Completion ---
-    script_end_time = time.time()
-    elapsed_secs = script_end_time - script_start_time
-    elapsed_mins = elapsed_secs / 60
-    print("-" * 60)
-    print(f" Forecast Script Completed ")
-    print(f" End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ")
-    print(f" Total Elapsed Time: {elapsed_mins:.2f} minutes ({elapsed_secs:.1f} seconds) ")
-    print("=" * 60)
+    model.eval()
+    all_preds = []
+    all_targets = []
+    all_weights = [] # To store weights
 
+    is_main_process = True # Assume called from main process during standard eval
+    data_iterator = tqdm(dataloader, desc="Agg. Err Eval", leave=False, disable=not is_main_process)
 
-if __name__ == "__main__":
-    # Validate essential config settings before running main
-    if (config.FORECAST_START_YEAR is None and config.FORECAST_START_MONTH is not None) or \
-       (config.FORECAST_START_YEAR is not None and config.FORECAST_START_MONTH is None):
-        print("\n--- CONFIGURATION ERROR ---")
-        print(" In config.py: FORECAST_START_YEAR and FORECAST_START_MONTH must be provided together")
-        print(" OR both must be set to None (to use the latest available data).")
-        print("---------------------------\n")
-        sys.exit(1)
-    if config.FORECAST_START_MONTH is not None and not (1 <= config.FORECAST_START_MONTH <= 12):
-        print("\n--- CONFIGURATION ERROR ---")
-        print(f" In config.py: FORECAST_START_MONTH ({config.FORECAST_START_MONTH}) must be between 1 and 12.")
-        print("---------------------------\n")
-        sys.exit(1)
-    if not config.FORECAST_PERIODS or config.FORECAST_PERIODS <= 0:
-        print("\n--- CONFIGURATION ERROR ---")
-        print(f" In config.py: FORECAST_PERIODS ({config.FORECAST_PERIODS}) must be a positive integer.")
-        print("---------------------------\n")
-        sys.exit(1)
-    if not config.MC_SAMPLES or config.MC_SAMPLES <= 0:
-        print("\n--- CONFIGURATION ERROR ---")
-        print(f" In config.py: MC_SAMPLES ({config.MC_SAMPLES}) must be a positive integer.")
-        print("---------------------------\n")
-        sys.exit(1)
+    with torch.no_grad():
+        # Dataloader provides (x, y, w, mask)
+        for x_batch, y_batch, w_batch, mask_batch in data_iterator:
+            x_batch, mask_batch = x_batch.to(device), mask_batch.to(device)
+            # y_batch and w_batch stay on CPU as we only need it for final calculation
 
-    # Run the main forecasting process
-    main()
+            outputs = model(x_batch, src_key_padding_mask=mask_batch)
+            # Deterministic forecast using argmax
+            predicted = torch.argmax(outputs.data, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(y_batch.numpy()) # y_batch was already on CPU
+            all_weights.extend(w_batch.numpy()) # Store weights
+
+    if not all_targets:
+        print("Warning: No targets found in dataset for aggregate error calculation.")
+        return float('inf') # Return infinity if no data
+
+    all_targets_np = np.array(all_targets)
+    all_preds_np = np.array(all_preds)
+    all_weights_np = np.array(all_weights) # Convert weights to numpy array
+
+    # --- Calculate WEIGHTED aggregate unemployment rate ---
+    # Actual
+    actual_unemployed_weight = np.sum(all_weights_np[all_targets_np == unemployed_idx])
+    actual_employed_weight = np.sum(all_weights_np[all_targets_np == employed_idx])
+    actual_labor_force_weight = actual_employed_weight + actual_unemployed_weight
+    if actual_labor_force_weight == 0:
+         print("Warning: Actual weighted labor force size is zero. Cannot calculate actual rate.")
+         actual_agg_rate = 0.0
+    else:
+         actual_agg_rate = actual_unemployed_weight / actual_labor_force_weight
+
+    # Predicted
+    predicted_unemployed_weight = np.sum(all_weights_np[all_preds_np == unemployed_idx])
+    predicted_employed_weight = np.sum(all_weights_np[all_preds_np == employed_idx])
+    predicted_labor_force_weight = predicted_employed_weight + predicted_unemployed_weight
+    if predicted_labor_force_weight == 0:
+         print("Warning: Predicted weighted labor force size is zero. Cannot calculate predicted rate.")
+         predicted_agg_rate = 0.0
+    else:
+         predicted_agg_rate = predicted_unemployed_weight / predicted_labor_force_weight
+
+    # Calculate Mean Squared Error between the single rate values
+    error = mean_squared_error([actual_agg_rate], [predicted_agg_rate])
+    print(f"  Weighted Agg. Rate Eval - Actual: {actual_agg_rate:.4f} (U={actual_unemployed_weight:.1f}/LF={actual_labor_force_weight:.1f}), "
+          f"Predicted: {predicted_agg_rate:.4f} (U={predicted_unemployed_weight:.1f}/LF={predicted_labor_force_weight:.1f}), MSE: {error:.6f}")
+
+    return error

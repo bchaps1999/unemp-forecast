@@ -2,32 +2,6 @@ import torch
 import torch.nn as nn
 import math
 
-# Use a module-level flag to track if we've already printed device info
-_DEVICE_INFO_PRINTED = False
-
-def get_device():
-    """Gets the best available device (CUDA, MPS, or CPU)."""
-    global _DEVICE_INFO_PRINTED
-    
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        device_name = "CUDA/GPU"
-    elif hasattr(torch, 'backends') and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = torch.device("mps")
-        device_name = "Apple Silicon GPU" 
-    else:
-        device = torch.device("cpu")
-        device_name = "CPU"
-    
-    # Print device info only once per process
-    if not _DEVICE_INFO_PRINTED:
-        print(f"Using device: {device_name}")
-        _DEVICE_INFO_PRINTED = True
-    
-    return device
-
-DEVICE = get_device()
-
 # --- Custom Positional Embedding Layer Definition (PyTorch) ---
 class PositionalEmbedding(nn.Module):
     def __init__(self, seq_len, embed_dim):

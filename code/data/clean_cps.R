@@ -358,8 +358,9 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
 #' Process CPS data into panel format with derived variables
 #'
 #' @param cps CPS data.table (expects output from get_cps_data)
+#' @param national_rates_output_path Path to save the national rates CSV.
 #' @return Processed CPS data as data.table
-process_cps_data <- function(cps) {
+process_cps_data <- function(cps, national_rates_output_path = NULL) {
   # Ensure input is a data.table
   if (!is.data.table(cps)) setDT(cps)
 
@@ -592,10 +593,24 @@ process_cps_data <- function(cps) {
       national_unemp_rate = fifelse(national_lf_w > 0, national_unemp_w / national_lf_w, NA_real_),
       national_emp_rate = fifelse(national_lf_w > 0, national_emp_w / national_lf_w, NA_real_)
   )]
-  # Select columns to merge and ensure unique by date
+  # Select columns and ensure unique by date
   national_rates <- unique(national_rates[, .(date, national_unemp_rate, national_emp_rate)])
+  setorder(national_rates, date) # Ensure chronological order
 
-  # Merge rates back onto the main dataset using data.table joins
+  # --- Save National Rates ---
+  if (!is.null(national_rates_output_path)) {
+    message("Saving national aggregate rates to: ", national_rates_output_path)
+    tryCatch({
+      dir.create(dirname(national_rates_output_path), recursive = TRUE, showWarnings = FALSE)
+      fwrite(national_rates, file = national_rates_output_path)
+    }, error = function(e) {
+      warning("Failed to save national rates file: ", e$message)
+    })
+  } else {
+    message("National rates output path not provided, skipping save.")
+  }
+
+  # --- Merge Rates Back (Optional for individual data, keep for consistency) ---
   message("Merging aggregate rates onto individual data using data.table joins...")
   # Use on= to specify join columns, use i. prefix for incoming columns
   cps[national_rates, on = "date", `:=`(national_unemp_rate = i.national_unemp_rate, national_emp_rate = i.national_emp_rate)]
