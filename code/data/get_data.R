@@ -8,8 +8,8 @@
 
 # Ensure 'here' package is available for robust path management
 if (!requireNamespace("here", quietly = TRUE)) {
-  message("Installing 'here' package for robust path management...")
-  install.packages("here")
+  # Installation handled by renv, just stop if not found after renv::load
+  stop("Package 'here' is required but not found. Please ensure renv environment is active and restored.")
 }
 library(here)
 

@@ -5,8 +5,12 @@
 #' @return NULL
 load_cps_packages <- function() {
   packages <- c("ipumsr", "janitor", "lubridate", "plm", "tidyverse", "dotenv", "data.table")
-  missing_packages <- setdiff(packages, rownames(installed.packages()))
-  if (length(missing_packages) > 0) install.packages(missing_packages)
+  # Check if packages are available, stop if not (renv should handle installation)
+  missing_packages <- packages[!sapply(packages, requireNamespace, quietly = TRUE)]
+  if (length(missing_packages) > 0) {
+    stop("Required CPS processing packages not found: ", paste(missing_packages, collapse=", "),
+         ". Please ensure renv environment is active and restored.")
+  }
   invisible(lapply(packages, library, character.only = TRUE))
 
   options(scipen = 999, digits = 4)

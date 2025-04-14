@@ -4,8 +4,12 @@
 # Load required packages
 load_scraper_packages <- function() {
   pkgs <- c("rvest", "dplyr", "stringr", "readr")
-  missing <- setdiff(pkgs, rownames(installed.packages()))
-  if (length(missing) > 0) install.packages(missing)
+  # Check if packages are available, stop if not (renv should handle installation)
+  missing <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
+  if (length(missing) > 0) {
+    stop("Required scraper packages not found: ", paste(missing, collapse=", "),
+         ". Please ensure renv environment is active and restored.")
+  }
   invisible(lapply(pkgs, library, character.only = TRUE))
 }
 
