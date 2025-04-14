@@ -20,7 +20,7 @@ PREPROCESS_INPUT_FILE = PROJECT_ROOT / "data/processed/cps_transitions.csv"
 PREPROCESS_OUTPUT_DIR = PROJECT_ROOT / "data/processed/transformer_input"
 PREPROCESS_START_DATE = None # "YYYY-MM-DD" or None
 PREPROCESS_END_DATE = None   # "YYYY-MM-DD" or None
-PREPROCESS_NUM_INDIVIDUALS = 200000 # Integer or None
+PREPROCESS_NUM_INDIVIDUALS = None # Integer or None
 TRAIN_SPLIT = 0.7
 VAL_SPLIT = 0.15
 # Test split is implicitly 1 - TRAIN_SPLIT - VAL_SPLIT
@@ -55,8 +55,7 @@ TRAIN_START_DATE = None # "YYYY-MM-DD" or None to use all available data before 
 TRAIN_END_DATE = "2019-12-31"   # "YYYY-MM-DD" or None to use all available data after TRAIN_START_DATE
 
 # Model Hyperparameters
-SEQUENCE_LENGTH = 24 # Fixed sequence length
-EMBED_DIM = 64
+SEQUENCE_LENGTH = 28 # Forecast periods + 16 (max possible length of CPS history)
 NUM_HEADS = 4
 FF_DIM = 64 # Feed-forward inner dim in transformer block
 NUM_TRANSFORMER_BLOCKS = 2
