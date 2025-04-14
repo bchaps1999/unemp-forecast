@@ -6,7 +6,7 @@ library(ipumsr)
 library(janitor)
 library(lubridate)
 library(plm)
-library(tidyverse) # Includes dplyr, readr, etc.
+# library(tidyverse) # Removed - Load specific packages if needed, many are dependencies anyway
 library(dotenv)
 library(data.table)
 
