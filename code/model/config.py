@@ -21,9 +21,9 @@ PREPROCESS_OUTPUT_DIR = PROJECT_ROOT / "data/processed/transformer_input"
 PREPROCESS_START_DATE = None # "YYYY-MM-DD" or None
 PREPROCESS_END_DATE = None   # "YYYY-MM-DD" or None
 # Sampling for FINAL training/validation splits (after HPT)
-PREPROCESS_NUM_INDIVIDUALS_FULL = 50000 # Integer or None for all individuals before TRAIN_END_DATE (excluding HPT intervals)
+PREPROCESS_NUM_INDIVIDUALS_FULL = 1500000 # Integer or None for all individuals before TRAIN_END_DATE (excluding HPT intervals)
 # Sampling for HPT training/validation splits (during HPT)
-PREPROCESS_NUM_INDIVIDUALS_HPT = 50000 # Integer or None for all individuals before HPT intervals
+PREPROCESS_NUM_INDIVIDUALS_HPT = 750000 # Integer or None for all individuals before HPT intervals
 TRAIN_SPLIT = 0.7
 VAL_SPLIT = 0.15
 # Test split is implicitly 1 - TRAIN_SPLIT - VAL_SPLIT
