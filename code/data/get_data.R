@@ -6,12 +6,20 @@
 #'
 #' @author Brendan Chapuis
 
-# Set project root
-project_root <- "/Users/brendanchapuis/Projects/research/labor-abm"
+# Ensure 'here' package is available for robust path management
+if (!requireNamespace("here", quietly = TRUE)) {
+  message("Installing 'here' package for robust path management...")
+  install.packages("here")
+}
+library(here)
 
-# Source required modules
-source(file.path(project_root, "code", "data", "scrape_cps_samples.R"))
-source(file.path(project_root, "code", "data", "clean_cps.R"))
+# Set project root using here() - Finds the .Rproj file or .git folder
+project_root <- here::here()
+message("Project Root (using here): ", project_root)
+
+# Source required modules using here() for robust paths
+source(here::here("code", "data", "scrape_cps_samples.R"))
+source(here::here("code", "data", "clean_cps.R"))
 
 # --- Define Pipeline Parameters --- 
 # These parameters will be used when the script is sourced.
