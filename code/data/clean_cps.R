@@ -50,7 +50,7 @@ get_cps_samples <- function(project_root, start_date = "2019-01", end_date = "20
                             include_asec = FALSE, force_scrape = FALSE) {
   metadata_dir <- file.path(project_root, "data", "metadata")
   samples_file <- file.path(metadata_dir, "cps_sample_ids.csv")
-  scraper_path <- file.path(project_root, "code", "build", "data", "scrape_cps_samples.R") # Define scraper path
+  scraper_path <- file.path(project_root, "code", "data", "scrape_cps_samples.R") # Define scraper path
 
   # Scrape if needed
   if (!file.exists(samples_file) || force_scrape) {
