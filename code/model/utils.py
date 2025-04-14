@@ -366,7 +366,8 @@ def setup_sequence_generation(hparams, train_data_baked, val_data_baked, hpt_val
     if parallel_workers <= 0:
         try:
             num_cores = multiprocessing.cpu_count()
-            parallel_workers = min(max(1, num_cores // 2), 8)
+            # Use num_cores - 1 to leave one core for the main process/OS, ensure at least 1 worker
+            parallel_workers = max(1, num_cores - 1)
             print(f"Parallel workers dynamically set to {parallel_workers} (detected {num_cores} cores)")
         except NotImplementedError:
             print("Could not detect CPU count. Setting parallel workers to 1.")
