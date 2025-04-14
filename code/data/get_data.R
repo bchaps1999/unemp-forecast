@@ -23,6 +23,11 @@ message("Project Root (using here): ", project_root)
 source(here::here("code", "data", "scrape_cps_samples.R"))
 source(here::here("code", "data", "clean_cps.R"))
 
+# --- Load Required Packages Directly ---
+# Load packages needed by clean_cps.R here, after renv is loaded by main.R
+message("--- Loading required CPS processing packages ---")
+load_cps_packages() # Call the function defined in clean_cps.R
+
 # --- Define Pipeline Parameters --- 
 # These parameters will be used when the script is sourced.
 output_file_param <- "data/processed/cps_transitions.csv"
@@ -104,7 +109,6 @@ run_cps_pipeline <- function(
   message("refresh_extract set to: ", refresh_extract)
   
   # Setup
-  load_cps_packages()
   output_path <- file.path(project_root, output_file)
   national_rates_path <- file.path(project_root, national_rates_output_file) # Define full path
   dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
