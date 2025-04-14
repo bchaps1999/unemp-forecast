@@ -1,21 +1,18 @@
 # Module for CPS data cleaning and processing
 # =========================================
 
-#' Load required packages for CPS data processing
-#' @return NULL
-load_cps_packages <- function() {
-  packages <- c("ipumsr", "janitor", "lubridate", "plm", "tidyverse", "dotenv", "data.table")
-  # Check if packages are available, stop if not (renv should handle installation)
-  missing_packages <- packages[!sapply(packages, requireNamespace, quietly = TRUE)]
-  if (length(missing_packages) > 0) {
-    stop("Required CPS processing packages not found: ", paste(missing_packages, collapse=", "),
-         ". Please ensure renv environment is active and restored.")
-  }
-  invisible(lapply(packages, library, character.only = TRUE))
+# Load required packages directly for renv detection
+library(ipumsr)
+library(janitor)
+library(lubridate)
+library(plm)
+library(tidyverse) # Includes dplyr, readr, etc.
+library(dotenv)
+library(data.table)
 
-  options(scipen = 999, digits = 4)
-  set.seed(8675309)
-}
+# Set options after loading packages
+options(scipen = 999, digits = 4)
+set.seed(8675309)
 
 #' Initialize IPUMS API key from .env file
 #'

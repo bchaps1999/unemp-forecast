@@ -1,78 +1,95 @@
-#!/usr/bin/env Rscript
-
-# --- Main Orchestration Script ---
+# Main Orchestration Script
 
 # --- 1. Setup ---
 message("===== Starting Main R Orchestration Script =====")
 start_time <- Sys.time()
 
 # --- 2. Load renv Environment ---
-# This needs to happen *before* loading other packages managed by renv
 message("\n--- Loading renv environment ---")
-# Ensure 'renv' package is available (renv should handle installation)
 if (!requireNamespace("renv", quietly = TRUE)) {
-  stop("Package 'renv' is required but not found. Has 'renv::init()' been run for this project?")
+  stop("Package 'renv' is required but not found. Run 'renv::init()'.")
 }
-library(renv) # Load renv
+library(renv)
 
-# Set project root early using here::here() if available, otherwise guess
-# We need the project root for renv::load()
-project_root <- NULL
-if (requireNamespace("here", quietly = TRUE)) {
-  library(here)
-  project_root <- here::here()
-  message("Project Root (using here): ", project_root)
-} else {
-  # Fallback if 'here' isn't installed yet (renv might install it)
-  # This assumes the script is run from the project root or similar standard location
-  project_root <- getwd()
-  warning("Package 'here' not found initially. Attempting to use current working directory as project root for renv: ", project_root,
-          "\nIf this fails, ensure 'here' is installed or run script from project root.")
-}
-
+# Use getwd() initially for project root. Confirm with here() later.
+project_root <- getwd()
+message("Initial Project Root guess (using getwd): ", project_root)
 
 tryCatch({
-  # renv::load expects project path
+  # Load renv environment
   renv::load(project = project_root)
-  message("renv environment loaded successfully.")
+  message("renv::load() completed.")
+
+  # Explicitly set library path
+  renv_lib_path <- renv::paths$library(project = project_root)
+  message("renv library path: ", renv_lib_path)
+  .libPaths(c(renv_lib_path, .libPaths())) # Prepend renv lib path
+  message("Updated .libPaths(): ", paste(.libPaths(), collapse = "; "))
+
+  # --- 3. Load 'here' package ---
+  message("\n--- Loading 'here' package ---")
+  if (!requireNamespace("here", quietly = TRUE)) {
+    message("Search paths (.libPaths()): ", paste(.libPaths(), collapse = "\n"))
+    message("Files in renv library path (", renv_lib_path, "):")
+    print(list.files(renv_lib_path, recursive = TRUE, all.files = TRUE))
+    stop("Package 'here' not found after setting lib paths. Run 'renv::restore()'.")
+  }
+  library(here)
+  message("'here' package loaded successfully.")
+
 }, error = function(e) {
-  message("Error loading renv environment: ", e$message)
-  stop("Failed to load renv environment. Ensure it's initialized ('renv::init()') and potentially run 'renv::restore()'.")
+  message("Error during renv setup or 'here' loading: ", e$message)
+  stop("Failed to load renv environment or 'here' package. Run 'renv::init()' and 'renv::restore()'.")
 })
 
-# --- 3. Load 'here' package (now that renv is loaded) ---
-message("\n--- Loading 'here' package ---")
-# Ensure 'here' package is available (renv should have handled installation/loading path)
-if (!requireNamespace("here", quietly = TRUE)) {
-  stop("Package 'here' is required but not found, even after attempting to load renv. Please ensure renv environment is active and restored.")
+# --- 3.1 Confirm 'here' and set project root ---
+if (!"here" %in% .packages()) {
+    stop("Failed to load 'here' package. Check renv status.")
 }
-library(here)
-
-# Re-confirm project root using here() now that it's definitely loaded
-project_root <- here::here()
+project_root <- here::here() # Use here() now
 message("Project Root confirmed (using here): ", project_root)
-# No need to setwd() globally, here() manages relative paths
-
 
 # --- 4. Run Data Preparation Script ---
 message("\n--- Running Data Preparation (code/data/get_data.R) ---")
-# Use here() to construct the path relative to the project root
 data_script_path <- here::here("code", "data", "get_data.R")
 if (!file.exists(data_script_path)) {
   stop("Data preparation script not found: ", data_script_path)
 }
 tryCatch({
-  # Source the script using the absolute path from here()
-  # Sourcing changes the working directory temporarily, which is fine here.
-  message("Attempting to source: ", data_script_path) # Add message before sourcing
-  source(data_script_path, chdir = TRUE) # chdir=TRUE ensures it runs relative to its own dir if needed
-  message("Data preparation script sourced successfully.") # Changed message
+  message("Attempting to source: ", data_script_path)
+  source(data_script_path, chdir = TRUE) # chdir=TRUE runs script relative to its own dir
+  message("Data preparation script sourced successfully.")
 }, error = function(e) {
-  # Print the specific error message from the source call
   message("Error occurred while sourcing ", data_script_path, ":")
   message(e$message)
   stop("Data preparation script failed during sourcing.")
 })
 
 # --- 5. Prepare and Run Model Pipeline Shell Script ---
-# ...existing code...
+message("\n--- Preparing and Running Model Pipeline (code/model/run_model_pipeline.sh) ---")
+model_script_path <- here::here("code", "model", "run_model_pipeline.sh")
+
+if (!file.exists(model_script_path)) {
+  stop("Model pipeline script not found: ", model_script_path)
+}
+
+# Ensure the script has execute permissions
+message("Setting execute permissions for: ", model_script_path)
+chmod_cmd <- paste("chmod +x", shQuote(model_script_path)) # Use shQuote for paths with spaces
+system(chmod_cmd)
+
+# Execute the shell script
+message("Executing model pipeline script...")
+exit_code <- system(shQuote(model_script_path)) # Use shQuote
+
+if (exit_code != 0) {
+  stop("Model pipeline script failed with exit code: ", exit_code)
+} else {
+  message("Model pipeline script executed successfully.")
+}
+
+# --- 6. Completion ---
+end_time <- Sys.time()
+elapsed_total <- difftime(end_time, start_time, units = "mins")
+message("\n===== Main R Orchestration Script Finished =====")
+message("Total execution time: ", round(as.numeric(elapsed_total), 2), " minutes.")

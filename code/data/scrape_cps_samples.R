@@ -1,17 +1,11 @@
 # Module to scrape IPUMS CPS sample IDs table
 # =====================================================
 
-# Load required packages
-load_scraper_packages <- function() {
-  pkgs <- c("rvest", "dplyr", "stringr", "readr")
-  # Check if packages are available, stop if not (renv should handle installation)
-  missing <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
-  if (length(missing) > 0) {
-    stop("Required scraper packages not found: ", paste(missing, collapse=", "),
-         ". Please ensure renv environment is active and restored.")
-  }
-  invisible(lapply(pkgs, library, character.only = TRUE))
-}
+# Load required packages directly for renv detection
+library(rvest)
+library(dplyr)
+library(stringr)
+library(readr)
 
 #' Scrape CPS sample IDs from IPUMS website
 #'
@@ -20,8 +14,6 @@ load_scraper_packages <- function() {
 #' @return Path to the created CSV file or NULL if failed
 #' @export
 scrape_cps_samples <- function(output_dir, force = FALSE) {
-  load_scraper_packages()
-  
   # Setup output
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
   output_file <- file.path(output_dir, "cps_sample_ids.csv")

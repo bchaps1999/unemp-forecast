@@ -24,9 +24,8 @@ source(here::here("code", "data", "scrape_cps_samples.R"))
 source(here::here("code", "data", "clean_cps.R"))
 
 # --- Load Required Packages Directly ---
-# Load packages needed by clean_cps.R here, after renv is loaded by main.R
-message("--- Loading required CPS processing packages ---")
-load_cps_packages() # Call the function defined in clean_cps.R
+# Packages are now loaded via top-level library() calls in clean_cps.R
+message("--- Packages loaded via sourced scripts ---")
 
 # --- Define Pipeline Parameters --- 
 # These parameters will be used when the script is sourced.
