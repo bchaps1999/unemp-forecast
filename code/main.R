@@ -20,10 +20,14 @@ message("Project Root (using here): ", project_root)
 
 # --- 2. Load renv Environment ---
 message("\n--- Loading renv environment ---")
+# Ensure 'renv' package is available
+if (!requireNamespace("renv", quietly = TRUE)) {
+  message("Installing 'renv' package...")
+  install.packages("renv")
+}
+library(renv) # Load renv after ensuring it's installed
+
 tryCatch({
-  if (!requireNamespace("renv", quietly = TRUE)) {
-    stop("renv package not found. Please install it.")
-  }
   # renv::load expects project path, here() provides it
   renv::load(project = project_root)
   message("renv environment loaded successfully.")
