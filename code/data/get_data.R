@@ -41,7 +41,7 @@ force_scrape_param <- FALSE
 extract_start_date_param <- "2000-01" 
 extract_end_date_param <- "2025-03"
 # Dates to subset the downloaded data for processing/analysis
-subset_start_date_param <- "2005-01"
+subset_start_date_param <- "2000-01"
 subset_end_date_param <- "2025-03"
 include_asec_param <- FALSE
 debug_param <- TRUE # Set to TRUE for verbose output during sourced run
