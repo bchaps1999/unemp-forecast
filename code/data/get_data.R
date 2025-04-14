@@ -6,6 +6,8 @@
 #'
 #' @author Brendan Chapuis
 
+message("--- get_data.R script started ---") # Add initial message
+
 # Ensure 'here' package is available for robust path management
 if (!requireNamespace("here", quietly = TRUE)) {
   # Installation handled by renv, just stop if not found after renv::load

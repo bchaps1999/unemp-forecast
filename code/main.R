@@ -36,4 +36,23 @@ tryCatch({
 
 # --- 3. Run Data Preparation Script ---
 message("\n--- Running Data Preparation (code/data/get_data.R) ---")
-# Use here() to construct the path relative to the project
+# Use here() to construct the path relative to the project root
+data_script_path <- here::here("code", "data", "get_data.R")
+if (!file.exists(data_script_path)) {
+  stop("Data preparation script not found: ", data_script_path)
+}
+tryCatch({
+  # Source the script using the absolute path from here()
+  # Sourcing changes the working directory temporarily, which is fine here.
+  message("Attempting to source: ", data_script_path) # Add message before sourcing
+  source(data_script_path, chdir = TRUE) # chdir=TRUE ensures it runs relative to its own dir if needed
+  message("Data preparation script sourced successfully.") # Changed message
+}, error = function(e) {
+  # Print the specific error message from the source call
+  message("Error occurred while sourcing ", data_script_path, ":")
+  message(e$message)
+  stop("Data preparation script failed during sourcing.")
+})
+
+# --- 4. Prepare and Run Model Pipeline Shell Script ---
+# ...existing code...
