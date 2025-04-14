@@ -6,3 +6,5 @@ joblib
 tqdm
 optuna
 matplotlib
+pyarrow
+fastparquet
