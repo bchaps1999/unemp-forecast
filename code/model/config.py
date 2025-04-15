@@ -93,7 +93,7 @@ DEBUG_MODE = False # Enable debug mode (minimal usage currently)
 PARALLEL_WORKERS = -1 # Set to specific number (e.g., 4) or -1 for auto
 
 # --- Hyperparameter Tuning (HPT) Parameters ---
-HPT_N_TRIALS = 20 # Number of trials for Optuna
+HPT_N_TRIALS = 50 # Number of trials for Optuna
 HPT_TIMEOUT_SECONDS = None # Optional timeout for the entire study (e.g., 3600 * 6 for 6 hours)
 HPT_STUDY_NAME = "transformer_hpt_study" # Name for the Optuna study database file
 # HPT_EPOCHS defined above
@@ -144,7 +144,7 @@ FORECAST_OUTPUT_SUBDIR = PROJECT_ROOT / "output/forecast_transformer"
 # Simulation Parameters
 FORECAST_PERIODS = 12 # Number of periods to forecast ahead
 MC_SAMPLES = 10 # Number of Monte Carlo samples per period
-FORECAST_START_YEAR = 2020 # YYYY or None (defaults to latest in data)
+FORECAST_START_YEAR = 2021 # YYYY or None (defaults to latest in data)
 FORECAST_START_MONTH = 12 # MM or None (defaults to latest in data)
 SAVE_RAW_SAMPLES = True # Set to True to save the raw unemployment rate from each sample path
 

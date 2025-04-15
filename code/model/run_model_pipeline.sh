@@ -13,12 +13,8 @@ set -e
 
 # --- Configuration ---
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-# Use SLURM_SUBMIT_DIR if defined (running under Slurm), otherwise calculate relative path
-if [ -n "$SLURM_SUBMIT_DIR" ]; then
-  PROJECT_ROOT="$SLURM_SUBMIT_DIR"
-else
-  PROJECT_ROOT="$( cd "$SCRIPT_DIR/../.." &> /dev/null && pwd )" # Fallback for local execution
-fi
+# Always calculate PROJECT_ROOT relative to the script directory
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/../.." &> /dev/null && pwd )"
 VENV_DIR="$PROJECT_ROOT/.venv"
 REQUIREMENTS_FILE="$PROJECT_ROOT/requirements.txt"
 PYTHON_CMD="python3" # Or just "python" depending on your system

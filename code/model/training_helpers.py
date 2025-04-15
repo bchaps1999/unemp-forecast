@@ -90,11 +90,6 @@ def evaluate_epoch(model, dataloader, criterion, device):
 
              outputs = model(x_batch, src_key_padding_mask=mask_batch) # Pass padding mask
              
-             # --- DIAGNOSTIC PRINTS (Validation) ---
-             if total_samples == 0: # Print only for the first batch
-                 print(f"\nDEBUG (Validation, Batch 0):")
-                 print(f"  outputs shape: {outputs.shape}, dtype: {outputs.dtype}")
-                 print(f"  y_batch shape: {y_batch.shape}, dtype: {y_batch.dtype}")
              loss = criterion(outputs, y_batch) # Calculate loss *after* printing shapes
              if total_samples == 0:
                  print(f"  Calculated loss: {loss.item():.6f}")
