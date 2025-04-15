@@ -176,7 +176,6 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
                 else:
                     # Interpolate: W_interp = (1 - factor) * W_equal + factor * W_inv_freq
                     class_weights = (1 - factor) * W_equal + factor * W_inv_freq
-                    print(f"Final interpolated class weights for CrossEntropyLoss: {class_weights.cpu().numpy()}")
 
             else:
                 print("Warning: y_train_np is empty or None. Cannot compute class weights. Using unweighted loss.")
@@ -188,7 +187,7 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
         # --- Create Loss Criterion ---
         # Pass the calculated class_weights (can be None or a Tensor)
         criterion = nn.CrossEntropyLoss(weight=class_weights).to(DEVICE)
-        print(f"Loss criterion created {'with' if class_weights is not None else 'without'} class weights.")
+        print(f"Loss criterion created {'with' if class_weights is not None else 'without'} class weights.") # Existing print confirms if weights are tensor or None
 
         del train_data_baked, val_data_baked # Clear raw dataframes
         gc.collect()
@@ -196,7 +195,7 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
         # --- Step 3: Create DataLoaders (Train/Val) ---
         train_loader, val_loader, val_loader_params, val_dataset_loaded = create_dataloaders( # Removed class_weights_tensor
             x_train_np, y_train_np, weight_train_np, x_val_np, y_val_np, weight_val_np,
-            hparams, n_classes, DEVICE, parallel_workers
+            hparams, DEVICE, parallel_workers # Removed n_classes argument
         )
         val_loader_params_stored = val_loader_params.copy() # Store for final eval
         del x_train_np, y_train_np, weight_train_np, x_val_np, y_val_np, weight_val_np # Clear numpy arrays
@@ -204,6 +203,25 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
 
         # --- Step 4: Build Model ---
         model = build_model(hparams, n_features, n_classes, DEVICE)
+
+        # --- Compile Model (PyTorch 2.0+) ---
+        # Check if torch.compile is available and not on MPS (often slower on MPS)
+        if hasattr(torch, 'compile') and DEVICE.type != 'mps':
+            print("Attempting to compile model with torch.compile()...")
+            try:
+                # Options: 'default', 'reduce-overhead', 'max-autotune'
+                # 'reduce-overhead' might be good for smaller models/faster compile
+                # 'max-autotune' takes longer to compile but might yield best runtime
+                model = torch.compile(model, mode="default")
+                print("Model compiled successfully.")
+            except Exception as e:
+                print(f"Warning: torch.compile() failed: {e}. Proceeding without compiling.")
+        else:
+            if not hasattr(torch, 'compile'):
+                print("torch.compile() not available (requires PyTorch 2.0+).")
+            elif DEVICE.type == 'mps':
+                print("Skipping torch.compile() on MPS device (often not beneficial).")
+
 
         # --- Save Model Parameters Immediately ---
         try:

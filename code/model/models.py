@@ -115,16 +115,17 @@ class TransformerForecastingModel(nn.Module):
         if src_key_padding_mask is not None:
             # Invert mask: True for valid, False for padding
             mask = ~src_key_padding_mask.unsqueeze(-1).expand_as(x) # (batch, seq_len, embed_dim)
-            # Sum valid elements and divide by number of valid elements
+            # Sum valid elements along the sequence dimension
             masked_sum = torch.sum(x * mask, dim=1) # (batch, embed_dim)
-            valid_counts = mask.sum(dim=1) # (batch, embed_dim) - count per feature, take first
-            valid_counts = valid_counts[:, 0].unsqueeze(1) # (batch, 1) - count per sequence
-            # Avoid division by zero if a sequence is fully masked (shouldn't happen with valid data)
-            valid_counts = torch.clamp(valid_counts, min=1.0)
-            pooled_output = masked_sum / valid_counts
+            # Count valid elements along the sequence dimension (avoid division by zero)
+            valid_count = mask.sum(dim=1) # (batch, embed_dim)
+            # Clamp count to avoid division by zero if a sequence has no valid elements (shouldn't happen with proper padding)
+            valid_count = torch.clamp(valid_count, min=1.0)
+            pooled_output = masked_sum / valid_count # (batch, embed_dim)
         else:
-            # If no mask, just do regular mean pooling
+            # If no mask, perform standard mean pooling
             pooled_output = torch.mean(x, dim=1) # (batch, embed_dim)
+
 
         # Pass through MLP head
         x = self.mlp_head(pooled_output)

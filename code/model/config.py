@@ -21,9 +21,9 @@ PREPROCESS_OUTPUT_DIR = PROJECT_ROOT / "data/processed/transformer_input"
 PREPROCESS_START_DATE = None # "YYYY-MM-DD" or None
 PREPROCESS_END_DATE = None   # "YYYY-MM-DD" or None
 # Sampling for FINAL training/validation splits (after HPT)
-PREPROCESS_NUM_INDIVIDUALS_FULL = 1500000 # Integer or None for all individuals before TRAIN_END_DATE (excluding HPT intervals)
+PREPROCESS_NUM_INDIVIDUALS_FULL = 500000 # Integer or None for all individuals before TRAIN_END_DATE (excluding HPT intervals)
 # Sampling for HPT training/validation splits (during HPT)
-PREPROCESS_NUM_INDIVIDUALS_HPT = 750000 # Integer or None for all individuals before HPT intervals
+PREPROCESS_NUM_INDIVIDUALS_HPT = 200000 # Integer or None for all individuals before HPT intervals
 TRAIN_SPLIT = 0.7
 VAL_SPLIT = 0.15
 # Test split is implicitly 1 - TRAIN_SPLIT - VAL_SPLIT
@@ -93,11 +93,11 @@ DEBUG_MODE = False # Enable debug mode (minimal usage currently)
 PARALLEL_WORKERS = -1 # Set to specific number (e.g., 4) or -1 for auto
 
 # --- Hyperparameter Tuning (HPT) Parameters ---
-HPT_N_TRIALS = 50 # Number of trials for Optuna
+HPT_N_TRIALS = 20 # Number of trials for Optuna
 HPT_TIMEOUT_SECONDS = None # Optional timeout for the entire study (e.g., 3600 * 6 for 6 hours)
 HPT_STUDY_NAME = "transformer_hpt_study" # Name for the Optuna study database file
 # HPT_EPOCHS defined above
-HPT_OBJECTIVE_METRIC = 'variance' # Choose 'rmse' or 'variance' to minimize
+HPT_OBJECTIVE_METRIC = 'std_dev' # Choose 'rmse' or 'std_dev' to minimize
 HPT_FORECAST_HORIZON = 12 # Number of months to forecast in HPT objective calculation
 HPT_RESULTS_CSV = "hpt_results.csv" # Filename for HPT results log within study dir
 BEST_HPARAMS_PKL = "best_hparams.pkl" # Filename for best HPT params within study dir

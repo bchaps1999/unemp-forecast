@@ -479,7 +479,8 @@ def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shap
                                   feature_indices: dict # Pre-calculated indices
                                   ):
     """
-    Updates sequences for the next step. Shifts sequence, appends new features based on sampled state.
+    Updates sequences for the next step using vectorized operations where possible.
+    Shifts sequence, appends new features based on sampled state.
     Handles time updates, aggregate rate updates (using group/overall rates), and ind/occ/class updates on E transition.
     Operates primarily on NumPy arrays derived from tensors for easier manipulation, then converts back.
     """
@@ -497,7 +498,8 @@ def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shap
         raise ValueError("Metadata missing required state definitions ('employed', 'unemployed', 'nilf'/'not in labor force')")
 
     # Pre-extract indices from the helper dict
-    state_indices = feature_indices['state_indices']
+    state_indices = feature_indices['state_indices'] # Dict: {feature_name: index}
+    state_indices_values = list(state_indices.values()) # List of indices for state features
     age_idx, months_last_idx, durunemp_idx = feature_indices['age_idx'], feature_indices['months_last_idx'], feature_indices['durunemp_idx']
     nat_unemp_idx, nat_emp_idx = feature_indices['nat_unemp_idx'], feature_indices['nat_emp_idx']
     state_unemp_idx, state_emp_idx = feature_indices['state_unemp_idx'], feature_indices['state_emp_idx']
@@ -508,166 +510,142 @@ def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shap
     # --- Determine next period ---
     current_year = current_period // 100
     current_month = current_period % 100
-    if current_month == 12:
-        next_year, next_month = current_year + 1, 1
-    else:
-        next_year, next_month = current_year, current_month + 1
-    # next_period = next_year * 100 + next_month # Not strictly needed below
+    next_month_is_jan = (current_month == 12)
 
     # --- Get data onto CPU for processing ---
-    # sequence_history_np: Full history *before* this update step (N, S, F)
-    sequence_history_np = current_sequences_tensor.cpu().numpy()
-    # previous_features_np: Features from the *last* time step (N, F)
-    previous_features_np = sequence_history_np[:, -1, :]
-    # sampled_states_np: Predicted states for the *next* step (N,)
-    sampled_states_np = sampled_states.cpu().numpy()
+    sequence_history_np = current_sequences_tensor.cpu().numpy() # (N, S, F)
+    previous_features_np = sequence_history_np[:, -1, :] # Features from t-1 (N, F)
+    sampled_states_np = sampled_states.cpu().numpy() # Predicted states for next step (N,)
 
     # Create array for the NEW feature vectors (N, F) - initialized from previous step
     new_feature_vectors = np.copy(previous_features_np)
 
-    # --- Get original identifier columns needed ---
-    original_id_cols = metadata.get('original_identifier_columns', [])
-    state_col = 'statefip' if 'statefip' in original_id_cols else None # Adjust if name differs
-    ind_col = 'ind_group_cat' if 'ind_group_cat' in original_id_cols else None # Adjust if name differs
+    # --- Vectorized Feature Updates ---
 
-    # --- Update features loop ---
-    for i in range(n_individuals):
-        sampled_state_int = sampled_states_np[i]
-        previous_features = previous_features_np[i] # Features from t-1 (1D array)
-        ind_identifiers = original_identifiers_df.iloc[i] # Series with statefip, ind_group_cat etc.
-
-        # Determine previous state from the one-hot encoding in previous_features
-        previous_state_int = -1
-        for state_col_name, state_idx in state_indices.items():
-            if previous_features[state_idx] > 0.5: # Check if this state was active
-                # Find the integer key corresponding to this state name in target_map_inverse
-                state_str_from_col = state_col_name.split('cat__current_state_')[-1]
-                try:
-                    previous_state_int = next(k for k, v in target_map_inverse.items() if v == state_str_from_col)
-                    break
-                except StopIteration:
-                    # This should not happen if state_indices and target_map_inverse are consistent
-                    print(f"Warning: Could not map previous state feature '{state_col_name}' back to an integer state. Defaulting to -1.")
-                    break # Exit inner loop
-
-        # 1. Update 'current_state' based on sampled_state_int
-        # Reset all state flags first
-        for idx in state_indices.values(): new_feature_vectors[i, idx] = 0.0
-        try:
-            # Get the ORIGINAL state string (e.g., "Employed", "Not in Labor Force") from the inverse map
-            state_name_original = target_map_inverse[int(sampled_state_int)] # Ensure int key
-            # Construct the target column name using the ORIGINAL state string
-            target_col_name = f'cat__current_state_{state_name_original}'
-            # Find the index of this correctly constructed name
-            target_idx = state_indices[target_col_name]
-            new_feature_vectors[i, target_idx] = 1.0
-        except KeyError:
-             # This error could now mean the lookup_key is invalid OR the constructed target_col_name is not in state_indices
-             print(f"\n--- FATAL ERROR: KeyError during state update ---")
-             print(f"Individual Index: {i}")
-             print(f"Sampled state (int): {sampled_state_int} (Type: {type(sampled_state_int)})")
-             # Check if lookup_key is valid in the original map
-             if int(sampled_state_int) not in target_map_inverse:
-                 print(f"Failure Cause: Sampled integer key {int(sampled_state_int)} not found in target_map_inverse:")
-                 print(target_map_inverse)
-             else:
-                 # If key is valid, the constructed name must be wrong or missing from state_indices
-                 state_name_original = target_map_inverse.get(int(sampled_state_int), "<<Key Error>>")
-                 target_col_name = f'cat__current_state_{state_name_original}'
-                 print(f"Failure Cause: Constructed feature name '{target_col_name}' not found in available state_indices keys.")
-                 print(f"Available state_indices keys: {list(state_indices.keys())}")
-             print(f"Previous State Int derived: {previous_state_int}")
-             print(f"Previous Feature Vector (partial): {previous_features[:10]}...")
-             print(f"--- END FATAL ERROR ---")
-             raise # Re-raise the KeyError to halt execution here
-        except Exception as e:
-             print(f"ERROR updating state for sampled_state_int {sampled_state_int}: {e}")
-             state_name_val = locals().get('state_name_original', '<<Not Assigned>>')
-             print(f"State name derived: {state_name_val}")
-             print(f"Available state indices: {state_indices.keys()}")
-             raise # Re-raise other exceptions too
-
-        # 2. Update Time Features (Age, Months Since Last, Duration Unemployed)
-        if age_idx != -1 and next_month == 1: new_feature_vectors[i, age_idx] = previous_features[age_idx] + 1
-        if months_last_idx != -1: new_feature_vectors[i, months_last_idx] = previous_features[months_last_idx] + 1
-        if durunemp_idx != -1:
-            is_unemployed_now = (sampled_state_int == unemployed_int)
-            # Increment duration if newly unemployed, reset if not. Use previous duration value.
-            new_feature_vectors[i, durunemp_idx] = (previous_features[durunemp_idx] + 1) if is_unemployed_now else 0
-
-        # 3. Update Aggregate Rate Features (National, State, Industry)
-        # Use group rates calculated for this specific sample step
-        current_state_id = ind_identifiers.get(state_col, None) if state_col else None
-        current_ind_id = ind_identifiers.get(ind_col, None) if ind_col else None
-
-        # Get group-specific rates for this individual, if available
-        ind_state_rates = state_rates.get(current_state_id, None) if current_state_id else None
-        ind_industry_rates = industry_rates.get(current_ind_id, None) if current_ind_id else None
-
-        # Update state rates, keeping previous value if group rate is missing
-        if state_unemp_idx != -1:
-            new_rate = ind_state_rates.get('unemp_rate') if ind_state_rates is not None else None
-            new_feature_vectors[i, state_unemp_idx] = new_rate if new_rate is not None else previous_features[state_unemp_idx]
-        if state_emp_idx != -1:
-            new_rate = ind_state_rates.get('emp_rate') if ind_state_rates is not None else None
-            new_feature_vectors[i, state_emp_idx] = new_rate if new_rate is not None else previous_features[state_emp_idx]
-
-        # Update industry rates, keeping previous value if group rate is missing
-        if ind_unemp_idx != -1:
-            new_rate = ind_industry_rates.get('unemp_rate') if ind_industry_rates is not None else None
-            new_feature_vectors[i, ind_unemp_idx] = new_rate if new_rate is not None else previous_features[ind_unemp_idx]
-        if ind_emp_idx != -1:
-            new_rate = ind_industry_rates.get('emp_rate') if ind_industry_rates is not None else None
-            new_feature_vectors[i, ind_emp_idx] = new_rate if new_rate is not None else previous_features[ind_emp_idx]
-
-        # Update national rates (using the overall sample rate calculated for this step)
-        if nat_unemp_idx != -1: new_feature_vectors[i, nat_unemp_idx] = overall_sample_unemp_rate
-        if nat_emp_idx != -1: new_feature_vectors[i, nat_emp_idx] = overall_sample_emp_rate
-
-        # 4. Update Industry/Occupation/Class Worker Features on Transition to Employment
-        if previous_state_int == -1:
-             # Cannot determine previous state reliably, skip transition logic
-             pass
+    # 1. Update 'current_state' based on sampled_state_np
+    new_feature_vectors[:, state_indices_values] = 0.0 # Reset all state flags
+    # Create mapping from sampled state int to the correct feature index
+    state_int_to_feature_idx = {}
+    for state_int, state_name in target_map_inverse.items():
+        feature_name = f'cat__current_state_{state_name}'
+        if feature_name in state_indices:
+            state_int_to_feature_idx[state_int] = state_indices[feature_name]
         else:
-            transition_to_emp = (previous_state_int in [unemployed_int, nilf_int]) and (sampled_state_int == employed_int)
+            print(f"Warning: State feature '{feature_name}' for state {state_int} not found in state_indices.")
 
-            if transition_to_emp:
-                # Use the full sequence history for this individual *before* the update
-                ind_sequence_history = sequence_history_np[i] # Shape (seq_len, n_features)
+    # Map sampled states to their corresponding feature indices
+    # Handle potential missing mappings gracefully (though ideally all states should map)
+    target_feature_indices = np.array([state_int_to_feature_idx.get(s, -1) for s in sampled_states_np])
+    valid_indices_mask = (target_feature_indices != -1)
+    # Use advanced indexing to set the correct state flag to 1.0
+    if np.any(valid_indices_mask):
+        rows_to_update = np.arange(n_individuals)[valid_indices_mask]
+        cols_to_update = target_feature_indices[valid_indices_mask]
+        new_feature_vectors[rows_to_update, cols_to_update] = 1.0
+    if not np.all(valid_indices_mask):
+        print(f"Warning: Could not map {np.sum(~valid_indices_mask)} sampled states to feature indices.")
 
-                # Perform lookback for each group using the helper
-                last_ind_idx = _find_last_valid_category_index(ind_sequence_history, ind_group_indices, ind_unknown_indices)
-                last_occ_idx = _find_last_valid_category_index(ind_sequence_history, occ_group_indices, occ_unknown_indices)
-                last_cls_idx = _find_last_valid_category_index(ind_sequence_history, classwkr_indices, classwkr_unknown_indices)
 
-                # Update new feature vector if a valid historical category was found
-                if last_ind_idx != -1:
-                    # Reset all flags in this group first
-                    for idx in ind_group_indices.values(): new_feature_vectors[i, idx] = 0.0
-                    # Set the historical category flag
-                    new_feature_vectors[i, last_ind_idx] = 1.0
-                # Else: Keep the features inherited from the previous step (likely 'Unknown'/'NIU' or whatever was carried forward)
+    # 2. Update Time Features (Age, Months Since Last, Duration Unemployed)
+    if age_idx != -1 and next_month_is_jan:
+        new_feature_vectors[:, age_idx] += 1
+    if months_last_idx != -1:
+        new_feature_vectors[:, months_last_idx] += 1
+    if durunemp_idx != -1:
+        is_unemployed_now_mask = (sampled_states_np == unemployed_int)
+        # Increment duration if unemployed now, otherwise reset to 0
+        new_feature_vectors[:, durunemp_idx] = np.where(is_unemployed_now_mask, previous_features_np[:, durunemp_idx] + 1, 0)
 
-                if last_occ_idx != -1:
-                    for idx in occ_group_indices.values(): new_feature_vectors[i, idx] = 0.0
-                    new_feature_vectors[i, last_occ_idx] = 1.0
+    # 3. Update Aggregate Rate Features (National, State, Industry)
+    # Get original identifiers needed for mapping
+    original_id_cols = metadata.get('original_identifier_columns', [])
+    state_col = 'statefip' if 'statefip' in original_id_cols else None
+    ind_col = 'ind_group_cat' if 'ind_group_cat' in original_id_cols else None
 
-                if last_cls_idx != -1:
-                    for idx in classwkr_indices.values(): new_feature_vectors[i, idx] = 0.0
-                    new_feature_vectors[i, last_cls_idx] = 1.0
-            # --- End transition to emp block ---
-        # --- End previous state check block ---
-    # --- End individual loop ---
+    # Map group rates - use pandas merge/map for efficiency
+    # Create a temporary df with individual IDs and their group identifiers
+    temp_rate_df = pd.DataFrame({
+        'id_idx': np.arange(n_individuals), # Index corresponding to numpy arrays
+        'state_id': original_identifiers_df[state_col].values if state_col else None,
+        'ind_id': original_identifiers_df[ind_col].values if ind_col else None
+    })
+
+    # Map state rates
+    if state_col and state_unemp_idx != -1 and state_emp_idx != -1 and state_rates:
+        state_rates_df = pd.DataFrame.from_dict(state_rates, orient='index').rename_axis('state_id').reset_index()
+        temp_rate_df = pd.merge(temp_rate_df, state_rates_df, on='state_id', how='left')
+        # Fill missing rates with previous values
+        new_state_unemp = temp_rate_df['unemp_rate'].values
+        new_state_emp = temp_rate_df['emp_rate'].values
+        nan_mask_state_unemp = np.isnan(new_state_unemp)
+        nan_mask_state_emp = np.isnan(new_state_emp)
+        new_feature_vectors[:, state_unemp_idx] = np.where(nan_mask_state_unemp, previous_features_np[:, state_unemp_idx], new_state_unemp)
+        new_feature_vectors[:, state_emp_idx] = np.where(nan_mask_state_emp, previous_features_np[:, state_emp_idx], new_state_emp)
+        temp_rate_df.drop(columns=['unemp_rate', 'emp_rate'], inplace=True, errors='ignore') # Clean up columns
+
+    # Map industry rates
+    if ind_col and ind_unemp_idx != -1 and ind_emp_idx != -1 and industry_rates:
+        ind_rates_df = pd.DataFrame.from_dict(industry_rates, orient='index').rename_axis('ind_id').reset_index()
+        temp_rate_df = pd.merge(temp_rate_df, ind_rates_df, on='ind_id', how='left')
+        # Fill missing rates with previous values
+        new_ind_unemp = temp_rate_df['unemp_rate'].values
+        new_ind_emp = temp_rate_df['emp_rate'].values
+        nan_mask_ind_unemp = np.isnan(new_ind_unemp)
+        nan_mask_ind_emp = np.isnan(new_ind_emp)
+        new_feature_vectors[:, ind_unemp_idx] = np.where(nan_mask_ind_unemp, previous_features_np[:, ind_unemp_idx], new_ind_unemp)
+        new_feature_vectors[:, ind_emp_idx] = np.where(nan_mask_ind_emp, previous_features_np[:, ind_emp_idx], new_ind_emp)
+        # temp_rate_df.drop(columns=['unemp_rate', 'emp_rate'], inplace=True) # Columns already dropped if state rates were processed
+
+    # Update national rates (same for everyone)
+    if nat_unemp_idx != -1: new_feature_vectors[:, nat_unemp_idx] = overall_sample_unemp_rate
+    if nat_emp_idx != -1: new_feature_vectors[:, nat_emp_idx] = overall_sample_emp_rate
+
+    # --- Non-Vectorized Part: Update Industry/Occupation/Class Worker Features on Transition ---
+    # This part remains a loop due to the complexity of the lookback logic
+
+    # Determine previous state from the one-hot encoding in previous_features
+    # Find the index of the maximum value (should be 1.0) within the state feature columns
+    previous_state_feature_indices = np.argmax(previous_features_np[:, state_indices_values], axis=1)
+    # Map these feature indices back to the integer state representation
+    feature_idx_to_state_int = {v: k for k, v in state_int_to_feature_idx.items()}
+    previous_states_int = np.array([feature_idx_to_state_int.get(state_indices_values[idx], -1)
+                                    for idx in previous_state_feature_indices])
+
+    # Identify individuals transitioning to employment
+    transition_to_emp_mask = np.isin(previous_states_int, [unemployed_int, nilf_int]) & (sampled_states_np == employed_int)
+    transition_indices = np.where(transition_to_emp_mask)[0]
+
+    if len(transition_indices) > 0:
+        for i in tqdm(transition_indices, desc="Updating Transition Features", leave=False, disable=len(transition_indices)<1000): # Add tqdm for long loops
+            # Use the full sequence history for this individual *before* the update
+            ind_sequence_history = sequence_history_np[i] # Shape (seq_len, n_features)
+
+            # Perform lookback for each group using the helper
+            last_ind_idx = _find_last_valid_category_index(ind_sequence_history, ind_group_indices, ind_unknown_indices)
+            last_occ_idx = _find_last_valid_category_index(ind_sequence_history, occ_group_indices, occ_unknown_indices)
+            last_cls_idx = _find_last_valid_category_index(ind_sequence_history, classwkr_indices, classwkr_unknown_indices)
+
+            # Update new feature vector if a valid historical category was found
+            if last_ind_idx != -1:
+                new_feature_vectors[i, list(ind_group_indices.values())] = 0.0 # Reset group flags
+                new_feature_vectors[i, last_ind_idx] = 1.0 # Set historical flag
+            if last_occ_idx != -1:
+                new_feature_vectors[i, list(occ_group_indices.values())] = 0.0
+                new_feature_vectors[i, last_occ_idx] = 1.0
+            if last_cls_idx != -1:
+                new_feature_vectors[i, list(classwkr_indices.values())] = 0.0
+                new_feature_vectors[i, last_cls_idx] = 1.0
+            # Else: Keep the features inherited from the previous step (likely 'Unknown'/'NIU')
 
     # --- Shift sequences and append ---
-    # Shift left (remove oldest time step) from the original tensor's numpy representation
+    # Shift left (remove oldest time step)
     shifted_sequences_np = sequence_history_np[:, 1:, :]
     # Append the newly calculated feature vectors as the last time step
-    # Need to add a time dimension to new_feature_vectors: (N, F) -> (N, 1, F)
+    # Add a time dimension: (N, F) -> (N, 1, F)
     new_sequences_np = np.concatenate([shifted_sequences_np, new_feature_vectors[:, np.newaxis, :]], axis=1)
 
     # Convert back to tensor and return on the original device
-    return torch.from_numpy(new_sequences_np).to(device)
+    return torch.from_numpy(new_sequences_np.astype(np.float32)).to(device) # Ensure float32
 
 
 def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # Shape: (N, S, F), on DEVICE
@@ -1032,20 +1010,20 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
                                 # num_forecasts: int = 3, # Number of forecasts determined by intervals
                                 forecast_horizon: int = 12): # Months to forecast
     """
-    Calculates the HPT objective: RMSE of aggregate unemployment rate over multiple recursive forecasts,
-    using the pre-calculated national rates file as truth. Forecasts start at the beginning of each
-    interval defined in metadata['hpt_validation_intervals'].
+    Calculates the HPT objective: RMSE and Standard Deviation of aggregate unemployment rate error
+    over multiple recursive forecasts, using the pre-calculated national rates file as truth.
+    Forecasts start at the beginning of each interval defined in metadata['hpt_validation_intervals'].
     """
-    print("\n===== Calculating HPT Metric (Forecast RMSE vs National Rates File) =====")
+    print("\n===== Calculating HPT Metric (Forecast RMSE & Std Dev vs National Rates File) =====")
     if hpt_val_baked_data is None or hpt_val_baked_data.empty:
         print("HPT validation baked data is empty. Cannot select start periods.")
-        return {'rmse': float('inf'), 'variance': float('inf')}
+        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
     if not national_rates_file.exists():
-        print(f"ERROR: National rates file not found at {national_rates_file}. Cannot calculate HPT forecast RMSE.")
-        return {'rmse': float('inf'), 'variance': float('inf')}
+        print(f"ERROR: National rates file not found at {national_rates_file}. Cannot calculate HPT forecast metrics.")
+        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
     if 'hpt_validation_intervals' not in metadata or not metadata['hpt_validation_intervals']:
         print("ERROR: 'hpt_validation_intervals' not found or empty in metadata. Cannot determine forecast start periods.")
-        return {'rmse': float('inf'), 'variance': float('inf')}
+        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
 
     model.eval() # Ensure model is in eval mode
     all_forecast_errors = [] # Store (predicted_rate - actual_rate) for each month across all forecasts
@@ -1063,10 +1041,10 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
         print(f"Loaded actual national rates from {national_rates_file} for {len(actual_rates_df)} periods.")
         if actual_rates_df.empty:
             print("Warning: Loaded actual rates data is empty.")
-            return {'rmse': float('inf'), 'variance': float('inf')}
+            return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
     except Exception as e:
         print(f"Error loading or processing actual rates file {national_rates_file}: {e}")
-        return {'rmse': float('inf'), 'variance': float('inf')}
+        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
 
     # --- Determine Start Periods from HPT Intervals in Metadata ---
     hpt_intervals = metadata['hpt_validation_intervals']
@@ -1099,11 +1077,11 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
 
     except Exception as e:
         print(f"ERROR processing HPT intervals from metadata: {e}")
-        return {'rmse': float('inf'), 'variance': float('inf')}
+        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
 
     if not start_periods:
         print("ERROR: No valid start periods found based on HPT intervals and available actual rates data.")
-        return {'rmse': float('inf'), 'variance': float('inf')}
+        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
 
     print(f"Selected start periods for HPT forecast evaluation based on metadata intervals: {start_periods}")
     num_forecasts = len(start_periods) # Number of forecasts is now determined by valid intervals
@@ -1199,18 +1177,18 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
             traceback.print_exc()
             # Continue to next start period if possible, but the final RMSE might be unreliable
 
-    # --- Calculate Final RMSE ---
+    # --- Calculate Final Metrics ---
     if not all_forecast_errors:
-        print("ERROR: No forecast errors collected across all runs. Cannot calculate final RMSE.")
-        return {'rmse': float('inf'), 'variance': float('inf')}
+        print("ERROR: No forecast errors collected across all runs. Cannot calculate final metrics.")
+        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
 
     final_rmse = np.sqrt(np.mean(np.square(all_forecast_errors)))
-    final_variance = np.var(all_forecast_errors)
-    print(f"\nCalculated Final HPT Metrics (RMSE and Variance over {len(all_forecast_errors)} months across {num_forecasts} forecasts):")
+    final_std_dev = np.std(all_forecast_errors) # Calculate standard deviation
+    print(f"\nCalculated Final HPT Metrics (RMSE and Std Dev over {len(all_forecast_errors)} months across {num_forecasts} forecasts):")
     print(f"  RMSE: {final_rmse:.6f}")
-    print(f"  Variance: {final_variance:.6f}")
+    print(f"  Std Dev: {final_std_dev:.6f}") # Print standard deviation
 
-    return {'rmse': final_rmse, 'variance': final_variance}
+    return {'rmse': final_rmse, 'std_dev': final_std_dev} # Return std_dev
 
 # --- Standard Evaluation Function (from training script) ---
 def evaluate_aggregate_unemployment_error(model, dataloader, device, metadata):

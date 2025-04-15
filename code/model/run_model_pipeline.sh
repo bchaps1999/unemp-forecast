@@ -1,11 +1,24 @@
 #!/bin/bash
 
+#SBATCH --job-name=model_pipeline_job       # Job name
+#SBATCH --output=model_pipeline_output.txt   # Standard output and error log
+#SBATCH --ntasks=1                           # Number of tasks (usually 1 for a single job)
+#SBATCH --cpus-per-task=8                    # Number of CPU cores per task
+#SBATCH --mem=128G                             # Memory required per node
+#SBATCH --time=6:00:00                      # Time limit hrs:min:sec
+#SBATCH -p gpu --gres=gpu:1
+
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
 # --- Configuration ---
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-PROJECT_ROOT="$( cd "$SCRIPT_DIR/../.." &> /dev/null && pwd )" # Navigate two levels up from code/model
+# Use SLURM_SUBMIT_DIR if defined (running under Slurm), otherwise calculate relative path
+if [ -n "$SLURM_SUBMIT_DIR" ]; then
+  PROJECT_ROOT="$SLURM_SUBMIT_DIR"
+else
+  PROJECT_ROOT="$( cd "$SCRIPT_DIR/../.." &> /dev/null && pwd )" # Fallback for local execution
+fi
 VENV_DIR="$PROJECT_ROOT/.venv"
 REQUIREMENTS_FILE="$PROJECT_ROOT/requirements.txt"
 PYTHON_CMD="python3" # Or just "python" depending on your system
@@ -52,7 +65,7 @@ echo "Preprocessing script finished."
 
 echo "\n--- Running 02_main_train_tune.py (Standard Training) ---"
 # Add arguments here if needed, e.g., --use_trial TRIAL_NUM or --tune
-"$PYTHON_CMD" 02_main_train_tune.py
+"$PYTHON_CMD" 02_main_train_tune.py --tune
 echo "Training script finished."
 
 echo "\n--- Running 03_main_forecast.py ---"
