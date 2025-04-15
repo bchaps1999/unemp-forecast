@@ -4,7 +4,6 @@
 .env
 /attic
 .Rproj.user
-/models
 *.Rproj
 *.RData
 *.Rhistory
@@ -12,3 +11,8 @@
 *__pycache__*
 .DS_Store
 /.venv
+
+
+# Exclude all models directories except transformer_hpt_study
+models/*
+!models/transformer_hpt_study/
