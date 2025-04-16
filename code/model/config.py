@@ -21,7 +21,7 @@ PREPROCESS_OUTPUT_DIR = PROJECT_ROOT / "data/processed/transformer_input"
 PREPROCESS_START_DATE = None # "YYYY-MM-DD" or None
 PREPROCESS_END_DATE = None   # "YYYY-MM-DD" or None
 # Sampling for FINAL training/validation splits (after HPT)
-PREPROCESS_NUM_INDIVIDUALS_FULL = 500000 # Integer or None for all individuals before TRAIN_END_DATE (excluding HPT intervals)
+PREPROCESS_NUM_INDIVIDUALS_FULL = 1000000 # Integer or None for all individuals before TRAIN_END_DATE (excluding HPT intervals)
 # Sampling for HPT training/validation splits (during HPT)
 PREPROCESS_NUM_INDIVIDUALS_HPT = 200000 # Integer or None for all individuals before HPT intervals
 TRAIN_SPLIT = 0.7
@@ -95,7 +95,7 @@ DEBUG_MODE = False # Enable debug mode (minimal usage currently)
 PARALLEL_WORKERS = -1 # Set to specific number (e.g., 4) or -1 for auto
 
 # --- Hyperparameter Tuning (HPT) Parameters ---
-HPT_N_TRIALS = 50 # Number of trials for Optuna
+HPT_N_TRIALS = 100 # Number of trials for Optuna
 HPT_TIMEOUT_SECONDS = None # Optional timeout for the entire study (e.g., 3600 * 6 for 6 hours)
 HPT_STUDY_NAME = "transformer_hpt_study" # Name for the Optuna study database file
 # HPT_EPOCHS defined above
@@ -103,8 +103,6 @@ HPT_OBJECTIVE_METRIC = 'rmse' # Choose 'rmse' or 'std_dev' to minimize
 HPT_FORECAST_HORIZON = 12 # Number of months to forecast in HPT objective calculation
 HPT_RESULTS_CSV = "hpt_results.csv" # Filename for HPT results log within study dir
 BEST_HPARAMS_PKL = "best_hparams.pkl" # Filename for best HPT params within study dir
-# HPT Validation Data Path (used by HPT objective function)
-# HPT_VALIDATION_DATA_PATH_FOR_METRIC = PREPROCESS_OUTPUT_DIR / HPT_INTERVAL_DATA_FILENAME # REMOVED - Path constructed directly in tuning_helpers
 
 # HPT Search Space Definitions
 HPT_EMBED_DIM_OPTIONS = [32, 64, 128]
@@ -142,13 +140,10 @@ HPT_MC_SAMPLES = 3 # Number of MC samples for forecast during HPT objective calc
 # Input directory for model is TRAIN_OUTPUT_SUBDIR
 FORECAST_OUTPUT_SUBDIR = PROJECT_ROOT / "output/forecast_transformer"
 # Input data for forecasting will be TEST_DATA_FILENAME
-# FORECAST_INPUT_DATA_FILENAME = FULL_BAKED_FILENAME # REMOVED
 
 # Simulation Parameters
 FORECAST_PERIODS = 12 # Number of periods to forecast ahead
 MC_SAMPLES = 25 # Number of Monte Carlo samples per period
-# FORECAST_START_YEAR = 2021 # REMOVED - Replaced by FORECAST_LAUNCH_DATES
-# FORECAST_START_MONTH = 12 # REMOVED - Replaced by FORECAST_LAUNCH_DATES
 FORECAST_LAUNCH_DATES = ["2022-01-01", "2023-01-01", "2024-01-01"] # Launch dates for forecasts
 SAVE_RAW_SAMPLES = True # Set to True to save the raw unemployment rate from each sample path
 FORECAST_BATCH_SIZE = 512 # Batch size for processing individuals during forecast steps

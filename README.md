@@ -6,7 +6,7 @@ This project implements a pipeline to download and process Current Population Su
 
 1.  **IPUMS API Key:**
     *   Obtain an API key from [IPUMS USA](https://usa.ipums.org/usa/).
-    *   Create a file named `.env` in the project root directory (`/Users/brendanchapuis/Projects/research/labor-abm`).
+    *   Create a file named `.env` in the project root directory.
     *   Add the following line to the `.env` file, replacing `your_api_key_here` with your actual key:
         ```
         IPUMS_API_KEY=your_api_key_here
@@ -14,28 +14,34 @@ This project implements a pipeline to download and process Current Population Su
     *   The R scripts will automatically detect and use this key.
 
 2.  **Adjust Parameters (Optional - for resource constraints):**
+    *   The default parameters were tested on an M3 MacBook Air with 16GB RAM and 8 cores. For machines with less memory or fewer cores, consider these adjustments:
     *   **Data Download/Processing (R):** Edit `code/data/get_data.R`:
-        *   Modify `extract_start_date_param`, `extract_end_date_param`, `subset_start_date_param`, `subset_end_date_param` to use a smaller date range.
+        *   Reduce the date range to just a few years (e.g., Jan 2018 to Dec 2022) by changing `extract_start_date_param` and `extract_end_date_param`. This range provides sufficient data before and after Jan 2020 for all scripts to work properly.
         *   Set `refresh_extract_param = FALSE` to use previously downloaded raw IPUMS data if available.
     *   **Model Training/Tuning (Python):** Edit `code/model/config.py`:
-        *   Reduce `PREPROCESS_NUM_INDIVIDUALS_FULL` and `PREPROCESS_NUM_INDIVIDUALS_HPT` to use fewer individuals for training/validation.
-        *   Reduce `HPT_N_TRIALS` for faster hyperparameter tuning.
-        *   Adjust `EPOCHS` or `HPT_EPOCHS` for shorter training times.
-        *   Modify `SEQUENCE_LENGTH`, `BATCH_SIZE`, or model dimensions (`EMBED_DIM`, `FF_DIM`, etc.) for lower memory usage (may impact performance).
+        *   Reduce `PREPROCESS_NUM_INDIVIDUALS_FULL` and `PREPROCESS_NUM_INDIVIDUALS_HPT` to approximately 50,000 individuals for training/validation on machines with limited RAM.
+        *   Change `EARLY_STOPPING_PATIENCE` to 1 to reduce model training time.
 
 3.  **Run the Pipeline:**
-    *   Ensure you have R and the required R packages installed (the `renv` package is used for dependency management). Run `renv::restore()` in the R console within the project directory if needed.
-    *   Ensure you have Python 3 and the required Python packages installed (see `requirements.txt`). The `run_model_pipeline.sh` script attempts to set up a virtual environment and install requirements.
-    *   Execute the main R orchestration script from the project root directory:
+    *   Execute the main R orchestration script from the project root directory, which will take a little while:
         ```R
         # In your R console, ensure the working directory is the project root
-        # setwd("/Users/brendanchapuis/Projects/research/labor-abm") 
         source("code/main.R")
         ```
     *   This script will:
         *   Load the `renv` environment.
         *   Run the R data preparation script (`code/data/get_data.R`).
         *   Execute the shell script (`code/model/run_model_pipeline.sh`) which handles Python environment setup and runs the Python model pipeline scripts in sequence.
+        * Run the R plotting script (`code/plot/forecast_plots.R`)
+
+    *   If the pipeline fails, you can also run the scripts in this order (in an R session or Python virtual environment, depending on the script):
+        *   `code/data/get_data.R`
+        *   `code/model/01_preprocess_cps_data.py`
+        *   `code/model/02_main_train_tune.py`
+        *   `code/model/03_main_forecast.py`
+        *   `code/plot/plot_forecast.R`
+
+    *   Feel free to contact me if you can't get it to run!
 
 ## Script Descriptions
 
@@ -45,8 +51,9 @@ This project implements a pipeline to download and process Current Population Su
 *   **`code/data/scrape_cps_samples.R`**: An R script to scrape available CPS sample IDs from the IPUMS website, used to determine which samples to request.
 *   **`code/model/run_model_pipeline.sh`**: A shell script executed by `main.R`. It sets up the Python virtual environment (if needed), installs dependencies from `requirements.txt`, and runs the Python preprocessing, training/tuning, and forecasting scripts in order.
 *   **`code/model/01_preprocess_cps_data.py`**: Python script that takes the R-processed data, performs feature engineering specific to the Transformer model (e.g., scaling, one-hot encoding), handles time-based splitting for training, validation, testing, and HPT validation, and saves the "baked" data and preprocessing metadata/pipeline.
-*   **`code/model/02_main_train_tune.py`**: Python script for either running a standard training process using specified hyperparameters (potentially loaded from a previous tuning run) or initiating hyperparameter tuning using Optuna. It handles data loading, sequence generation, model building, training loops, evaluation, and saving results/checkpoints.
+*   **`code/model/02_main_train_tune.py`**: Python script for either running a standard training process using specified hyperparameters (potentially loaded from a previous tuning run) or initiating hyperparameter tuning using Optuna. It handles data loading, sequence generation, model building, training loops, evaluation, and saving results/checkpoints. You can run with "--tune" argument to enable hyperparameter tuning.
 *   **`code/model/03_main_forecast.py`**: Python script that loads a trained model and preprocessed test data, runs a multi-period forecasting simulation using Monte Carlo sampling, calculates aggregate unemployment rates, saves the forecast results, and generates a plot comparing the forecast to historical data.
+*   **`code/plot/plot_forecast.R`**: R script that batch-processes forecast outputs, generating publication-quality plots. It processes multiple forecast periods, adds confidence intervals, plots sample trajectories, and compares forecasts with historical unemployment rates.
 *   **`code/model/config.py`**: Central configuration file for the Python model pipeline, defining file paths, hyperparameters, tuning settings, and simulation parameters.
 *   **`code/model/utils.py`**: Python utility functions used across the model scripts (e.g., device selection, sequence generation, dataset class, signal handling).
 *   **`code/model/models.py`**: Defines the PyTorch `TransformerForecastingModel` architecture.

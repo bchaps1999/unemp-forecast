@@ -29,11 +29,10 @@ class FocalLoss(nn.Module):
     gamma > 0 reduces the relative loss for well-classified examples (pt > 0.5),
     putting more focus on hard, misclassified examples.
     """
-    def __init__(self, gamma=2.0, reduction='mean'): # Removed alpha
+    def __init__(self, gamma=2.0, reduction='mean'): 
         super(FocalLoss, self).__init__()
         self.gamma = gamma
         self.reduction = reduction
-        # Removed alpha handling
 
     def forward(self, inputs, targets):
         # inputs are expected to be logits (N, C)
@@ -49,8 +48,6 @@ class FocalLoss(nn.Module):
         # Calculate Focal Loss component
         focal_term = (1 - pt)**self.gamma
         loss = focal_term * ce_loss
-
-        # Removed alpha weighting section
 
         # Apply reduction based on init parameter
         if self.reduction == 'mean':

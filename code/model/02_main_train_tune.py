@@ -146,15 +146,6 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
             config.SEQUENCE_CACHE_DIR_NAME
         )
 
-        # --- Calculate Class Weights for Loss Criterion --- REMOVED ---
-        # print("\nCalculating class weights for loss function...")
-        # class_weights = None # Initialize to None (unweighted)
-        # try:
-        #     ... (entire class weight calculation block removed) ...
-        # except Exception as e:
-        #     print(f"Warning: Error calculating class weights: {e}. Using unweighted loss (alpha=None).")
-        #     class_weights = None
-
         # --- Create Loss Criterion ---
         # Use FocalLoss with reduction='none'. Sample weights applied in train_epoch.
         focal_gamma = hparams.get('focal_loss_gamma', config.FOCAL_LOSS_GAMMA) # Get gamma from hparams or config default

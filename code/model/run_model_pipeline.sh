@@ -61,7 +61,7 @@ echo "Preprocessing script finished."
 
 echo "\n--- Running 02_main_train_tune.py (Standard Training) ---"
 # Add arguments here if needed, e.g., --use_trial TRIAL_NUM or --tune
-"$PYTHON_CMD" 02_main_train_tune.py --tune
+"$PYTHON_CMD" 02_main_train_tune.py
 echo "Training script finished."
 
 echo "\n--- Running 03_main_forecast.py ---"
