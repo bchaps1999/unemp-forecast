@@ -82,6 +82,8 @@ EARLY_STOPPING_PATIENCE = 5  # Epochs to wait before early stopping
 LR_SCHEDULER_FACTOR = 0.5     # Factor to reduce LR by when plateau detected
 LR_SCHEDULER_PATIENCE = 10    # Epochs to wait before reducing LR
 HPT_EPOCHS = 3 # Number of epochs to run during hyperparameter tuning trials
+FOCAL_LOSS_GAMMA = 2.0 # Focusing parameter for Focal Loss (0 means standard CE)
+TRANSITION_WEIGHT_FACTOR = 0.0 # Factor (0-1) to interpolate between no sample weight (0) and inverse frequency transition weights (1). Default 0.
 
 # Training Flags
 REFRESH_MODEL = False # Force retraining even if model exists
@@ -97,7 +99,7 @@ HPT_N_TRIALS = 50 # Number of trials for Optuna
 HPT_TIMEOUT_SECONDS = None # Optional timeout for the entire study (e.g., 3600 * 6 for 6 hours)
 HPT_STUDY_NAME = "transformer_hpt_study" # Name for the Optuna study database file
 # HPT_EPOCHS defined above
-HPT_OBJECTIVE_METRIC = 'std_dev' # Choose 'rmse' or 'std_dev' to minimize
+HPT_OBJECTIVE_METRIC = 'rmse' # Choose 'rmse' or 'std_dev' to minimize
 HPT_FORECAST_HORIZON = 12 # Number of months to forecast in HPT objective calculation
 HPT_RESULTS_CSV = "hpt_results.csv" # Filename for HPT results log within study dir
 BEST_HPARAMS_PKL = "best_hparams.pkl" # Filename for best HPT params within study dir
@@ -122,17 +124,18 @@ HPT_MLP_DROPOUT_MAX = 0.6 # Increased from 0.5
 HPT_LR_MIN = 1e-5
 HPT_LR_MAX = 1e-3
 HPT_BATCH_SIZE_OPTIONS = [32, 64, 128, 256] # Added 256
-# Add search space for loss weight factor
-# Interpolates between unweighted (0.0) and inverse frequency weights (1.0).
-# Factor = 0.0 -> No weights (equal weight per class)
-# Factor = 1.0 -> Standard inverse frequency weighting for all classes
-# Factor = (0.0, 1.0) -> Linear interpolation between equal and inverse frequency weights
-HPT_LOSS_WEIGHT_FACTOR_MIN = 0.0 # Start from unweighted
-HPT_LOSS_WEIGHT_FACTOR_MAX = 0.1 # End at full inverse frequency weighting
+# Add search space for Focal Loss gamma
+HPT_FOCAL_LOSS_GAMMA_MIN = 0.0 # Gamma=0 is equivalent to CrossEntropy
+HPT_FOCAL_LOSS_GAMMA_MAX = 5.0
+# Add search space for transition weight factor
+HPT_TRANSITION_WEIGHT_FACTOR_MIN = 0.0 # 0 = no transition weighting
+HPT_TRANSITION_WEIGHT_FACTOR_MAX = 1.0 # 1 = full inverse frequency transition weighting
 
 # HPT Pruner Settings
 HPT_PRUNER_STARTUP = 5 # Number of trials before pruning starts
 HPT_PRUNER_WARMUP = 3 # Number of epochs within a trial before pruning can occur
+# Add HPT MC Samples
+HPT_MC_SAMPLES = 3 # Number of MC samples for forecast during HPT objective calculation (can increase for stability)
 
 # --- 03_forecast_transformer.py Parameters ---
 # Input directory for baked data is PREPROCESS_OUTPUT_DIR
@@ -143,10 +146,13 @@ FORECAST_OUTPUT_SUBDIR = PROJECT_ROOT / "output/forecast_transformer"
 
 # Simulation Parameters
 FORECAST_PERIODS = 12 # Number of periods to forecast ahead
-MC_SAMPLES = 10 # Number of Monte Carlo samples per period
-FORECAST_START_YEAR = 2021 # YYYY or None (defaults to latest in data)
-FORECAST_START_MONTH = 12 # MM or None (defaults to latest in data)
+MC_SAMPLES = 25 # Number of Monte Carlo samples per period
+# FORECAST_START_YEAR = 2021 # REMOVED - Replaced by FORECAST_LAUNCH_DATES
+# FORECAST_START_MONTH = 12 # REMOVED - Replaced by FORECAST_LAUNCH_DATES
+FORECAST_LAUNCH_DATES = ["2022-01-01", "2023-01-01", "2024-01-01"] # Launch dates for forecasts
 SAVE_RAW_SAMPLES = True # Set to True to save the raw unemployment rate from each sample path
+FORECAST_BATCH_SIZE = 512 # Batch size for processing individuals during forecast steps
+FORECAST_PLOT_HISTORY_YEARS = 1 # Years of history to show on forecast plots
 
 # Only print this message when the file is run directly, not when imported
 if __name__ == "__main__":

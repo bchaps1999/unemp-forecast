@@ -16,7 +16,7 @@ import optuna
 import traceback
 import ast
 import gc
-from sklearn.utils.class_weight import compute_class_weight # Import for weight calculation
+# from sklearn.utils.class_weight import compute_class_weight # No longer needed
 
 # --- Project Imports ---
 import config # General configuration
@@ -27,7 +27,8 @@ from utils import ( # Common utilities
 )
 from models import TransformerForecastingModel # Model definition
 from training_helpers import ( # Functions for the training loop
-    create_dataloaders, build_model, run_training_loop, evaluate_epoch
+    create_dataloaders, build_model, run_training_loop, evaluate_epoch,
+    FocalLoss # Import FocalLoss
 )
 from forecasting_helpers import ( # For final evaluation and HPT objective
     evaluate_aggregate_unemployment_error, calculate_hpt_forecast_metrics # Renamed from calculate_hpt_forecast_rmse
@@ -128,77 +129,52 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
         # --- Add derived params to hparams for saving ---
         hparams['n_features'] = n_features
         hparams['n_classes'] = n_classes
-        weight_col = metadata.get('weight_column', config.WEIGHT_COL) # Get weight column name
+        # weight_col = metadata.get('weight_column', config.WEIGHT_COL) # Survey weight col name
+        survey_weight_col = metadata.get('weight_column', config.WEIGHT_COL) # Use survey weight col name
         target_map_inverse = metadata.get('target_state_map_inverse', {}) # Get target map
 
-        # --- Step 2: Generate Sequences (Train/Val only for training loop) ---
+        # --- Step 2: Generate Sequences & Sample Weights ---
         # HPT val sequences are generated separately if needed by the objective function
-        x_train_np, y_train_np, _, weight_train_np, \
-        x_val_np, y_val_np, _, weight_val_np, \
+        # setup_sequence_generation now returns sample_weights based on transitions for training set
+        x_train_np, y_train_np, _, sample_weights_train_np, \
+        x_val_np, y_val_np, _, sample_weights_val_np, \
         _, _, _, _, \
         parallel_workers = setup_sequence_generation(
             hparams, train_data_baked, val_data_baked, None, # Pass None for HPT data here
             processed_data_dir, config.GROUP_ID_COL, config.DATE_COL,
-            feature_names, n_features, weight_col, config.SEQUENCE_CACHE_DIR_NAME
+            feature_names, n_features, survey_weight_col, # Pass survey weight col name
+            config.SEQUENCE_CACHE_DIR_NAME
         )
 
-        # --- Calculate Class Weights for Loss Criterion ---
-        print("\nCalculating class weights for loss function...")
-        class_weights = None # Initialize to None (unweighted)
-        try:
-            # Calculate standard inverse frequency weights using the training targets
-            if y_train_np is not None and len(y_train_np) > 0:
-                unique_classes = np.unique(y_train_np)
-                # Ensure n_classes matches the number of unique classes found in training data
-                if len(unique_classes) != n_classes:
-                     print(f"Warning: Number of unique classes in y_train ({len(unique_classes)}) does not match metadata n_classes ({n_classes}). Using unique classes from y_train.")
-                     # Adjust n_classes if necessary? Or raise error? Let's proceed with caution.
-                     # It's safer to rely on the unique classes found in the actual training data.
-
-                base_weights_np = compute_class_weight('balanced', classes=unique_classes, y=y_train_np)
-                W_inv_freq = torch.tensor(base_weights_np, dtype=torch.float).to(DEVICE)
-                print(f"Base class weights (inverse frequency): {W_inv_freq.cpu().numpy()}")
-
-                # Define equal weights tensor (ones)
-                W_equal = torch.ones_like(W_inv_freq).to(DEVICE)
-                print(f"Equal weights baseline: {W_equal.cpu().numpy()}")
-
-                # Get the tunable factor
-                loss_weight_factor = hparams.get('loss_weight_factor', 1.0) # Default to 1.0 (full inverse freq)
-                print(f"Interpolation factor (loss_weight_factor): {loss_weight_factor}")
-
-                # Clamp factor to [0, 1] just in case
-                factor = max(0.0, min(1.0, loss_weight_factor))
-
-                if factor == 0.0:
-                    class_weights = None # Use unweighted loss
-                    print("Factor is 0. Using unweighted CrossEntropyLoss.")
-                else:
-                    # Interpolate: W_interp = (1 - factor) * W_equal + factor * W_inv_freq
-                    class_weights = (1 - factor) * W_equal + factor * W_inv_freq
-
-            else:
-                print("Warning: y_train_np is empty or None. Cannot compute class weights. Using unweighted loss.")
-
-        except Exception as e:
-            print(f"Warning: Error calculating class weights: {e}. Using unweighted loss.")
-            class_weights = None
+        # --- Calculate Class Weights for Loss Criterion --- REMOVED ---
+        # print("\nCalculating class weights for loss function...")
+        # class_weights = None # Initialize to None (unweighted)
+        # try:
+        #     ... (entire class weight calculation block removed) ...
+        # except Exception as e:
+        #     print(f"Warning: Error calculating class weights: {e}. Using unweighted loss (alpha=None).")
+        #     class_weights = None
 
         # --- Create Loss Criterion ---
-        # Pass the calculated class_weights (can be None or a Tensor)
-        criterion = nn.CrossEntropyLoss(weight=class_weights).to(DEVICE)
-        print(f"Loss criterion created {'with' if class_weights is not None else 'without'} class weights.") # Existing print confirms if weights are tensor or None
+        # Use FocalLoss with reduction='none'. Sample weights applied in train_epoch.
+        focal_gamma = hparams.get('focal_loss_gamma', config.FOCAL_LOSS_GAMMA) # Get gamma from hparams or config default
+        # Instantiate with reduction='none' for per-sample loss calculation in train_epoch
+        criterion = FocalLoss(gamma=focal_gamma, reduction='none').to(DEVICE)
+        print(f"Loss criterion created: FocalLoss (gamma={focal_gamma}, reduction='none'). Sample weights applied during training.")
 
         del train_data_baked, val_data_baked # Clear raw dataframes
         gc.collect()
 
         # --- Step 3: Create DataLoaders (Train/Val) ---
-        train_loader, val_loader, val_loader_params, val_dataset_loaded = create_dataloaders( # Removed class_weights_tensor
-            x_train_np, y_train_np, weight_train_np, x_val_np, y_val_np, weight_val_np,
-            hparams, DEVICE, parallel_workers # Removed n_classes argument
+        # Pass sample_weights_train_np and sample_weights_val_np
+        train_loader, val_loader, val_loader_params, val_dataset_loaded = create_dataloaders(
+            x_train_np, y_train_np, sample_weights_train_np,
+            x_val_np, y_val_np, sample_weights_val_np,
+            hparams, DEVICE, parallel_workers
         )
         val_loader_params_stored = val_loader_params.copy() # Store for final eval
-        del x_train_np, y_train_np, weight_train_np, x_val_np, y_val_np, weight_val_np # Clear numpy arrays
+        # Clear numpy arrays (including sample weights)
+        del x_train_np, y_train_np, sample_weights_train_np, x_val_np, y_val_np, sample_weights_val_np
         gc.collect()
 
         # --- Step 4: Build Model ---
@@ -398,7 +374,7 @@ def run_standard_training(args, base_output_dir):
         'mlp_dropout': config.MLP_DROPOUT,
         'learning_rate': config.LEARNING_RATE,
         'batch_size': config.BATCH_SIZE,
-        'loss_weight_factor': 1.0, # Default to standard inverse frequency weighting (factor=1.0)
+        # 'loss_weight_factor': 1.0, # REMOVED
         'epochs': config.EPOCHS, # Use standard epochs
         'early_stopping_patience': config.EARLY_STOPPING_PATIENCE,
         'max_grad_norm': config.MAX_GRAD_NORM,
@@ -410,6 +386,10 @@ def run_standard_training(args, base_output_dir):
         'random_seed': config.RANDOM_SEED,
         # Add HPT forecast horizon (not used directly in standard run, but good practice)
         'hpt_forecast_horizon': config.HPT_FORECAST_HORIZON,
+        # Add Focal Loss gamma
+        'focal_loss_gamma': config.FOCAL_LOSS_GAMMA,
+        # Add Transition Weight Factor
+        'transition_weight_factor': config.TRANSITION_WEIGHT_FACTOR,
     }
 
     # --- Parameter Loading Logic ---
@@ -434,8 +414,14 @@ def run_standard_training(args, base_output_dir):
                     trial_params_csv = trial_row.iloc[0].to_dict()
                     num_updated = 0
                     # Load only tunable keys from CSV
-                    # Add 'loss_weight_factor' to the list of tunable keys
+                    # Remove 'loss_weight_factor'
                     tunable_keys_from_csv = [col for col in trial_params_csv if col in standard_hparams and col not in ['sequence_length', 'epochs', 'refresh_sequences', 'early_stopping_patience', 'max_grad_norm', 'lr_scheduler_factor', 'lr_scheduler_patience', 'pad_value', 'parallel_workers', 'random_seed', 'hpt_forecast_horizon']]
+                    # Add focal_loss_gamma and transition_weight_factor if they exist in the CSV columns
+                    if 'focal_loss_gamma' in trial_params_csv:
+                        tunable_keys_from_csv.append('focal_loss_gamma')
+                    if 'transition_weight_factor' in trial_params_csv:
+                         tunable_keys_from_csv.append('transition_weight_factor')
+
 
                     for key in tunable_keys_from_csv:
                         value = trial_params_csv[key]

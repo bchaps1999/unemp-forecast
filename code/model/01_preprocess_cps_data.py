@@ -7,6 +7,7 @@ from pathlib import Path
 import os
 import sys
 import gc # Import garbage collector
+from collections import defaultdict # Import defaultdict
 
 # Import scikit-learn components
 from sklearn.model_selection import train_test_split
@@ -25,6 +26,118 @@ except ImportError:
     sys.exit(1)
 
 # --- Parameters & Configuration ---
+
+# Helper function for stratified weighted sampling
+def stratified_weighted_sample(df, target_n_individuals, id_col, weight_col, date_col, random_seed):
+    """
+    Performs stratified sampling of individuals based on time periods and weights.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing individual data, weights, and dates.
+        target_n_individuals (int): The desired number of unique individuals in the final sample.
+        id_col (str): Name of the column containing individual IDs.
+        weight_col (str): Name of the column containing sampling weights.
+        date_col (str): Name of the column containing dates.
+        random_seed (int): Random seed for reproducibility.
+
+    Returns:
+        np.ndarray: Array of unique sampled individual IDs.
+    """
+    if df.empty or target_n_individuals is None or target_n_individuals <= 0:
+        print("Stratified Sampling: Input empty or target N invalid. Returning empty array.")
+        return np.array([])
+
+    print(f"Stratified Sampling: Starting for target N = {target_n_individuals}")
+    temp_df = df[[id_col, weight_col, date_col]].copy()
+    temp_df['year'] = temp_df[date_col].dt.year
+
+    # Calculate total weight per year
+    yearly_weights = temp_df.groupby('year')[weight_col].sum()
+    total_weight = yearly_weights.sum()
+
+    if total_weight == 0:
+        print("Stratified Sampling: Total weight is zero. Performing random sampling instead.")
+        available_ids = df[id_col].unique()
+        actual_n = min(target_n_individuals, len(available_ids))
+        return np.random.choice(available_ids, actual_n, replace=False)
+
+    # Allocate target N proportionally to yearly weights
+    yearly_allocation = (yearly_weights / total_weight * target_n_individuals).round().astype(int)
+
+    # Ensure allocation sums roughly to target N (adjust last period if needed)
+    allocation_diff = target_n_individuals - yearly_allocation.sum()
+    if allocation_diff != 0 and not yearly_allocation.empty:
+        yearly_allocation.iloc[-1] += allocation_diff # Add difference to the last year
+
+    print(f"Stratified Sampling: Yearly allocations calculated (sum={yearly_allocation.sum()}).")
+
+    sampled_ids_by_year = defaultdict(list)
+    all_sampled_ids = set()
+
+    # Weighted sampling within each year
+    for year, n_allocated in yearly_allocation.items():
+        if n_allocated <= 0:
+            continue
+
+        year_df = temp_df[temp_df['year'] == year]
+        # Get unique individuals and their max weight in that year
+        unique_individuals_year = year_df.loc[year_df.groupby(id_col)[weight_col].idxmax()]
+
+        available_ids_year = unique_individuals_year[id_col].values
+        weights_year = unique_individuals_year[weight_col].values
+
+        if len(available_ids_year) == 0:
+            continue
+
+        # Normalize weights to prevent issues with zero weights if any exist
+        weights_year = np.maximum(weights_year, 0) # Ensure non-negative
+        total_weight_year = weights_year.sum()
+
+        if total_weight_year == 0: # If all weights are zero in this year, sample randomly
+             n_to_sample = min(n_allocated, len(available_ids_year))
+             ids_this_year = np.random.choice(available_ids_year, n_to_sample, replace=False)
+        elif len(available_ids_year) <= n_allocated:
+            # Sample all available if fewer than allocated
+            ids_this_year = available_ids_year
+        else:
+            # Perform weighted sampling
+            probabilities = weights_year / total_weight_year
+            ids_this_year = np.random.choice(
+                available_ids_year,
+                size=n_allocated,
+                replace=False,
+                p=probabilities
+            )
+
+        sampled_ids_by_year[year] = ids_this_year.tolist()
+        all_sampled_ids.update(ids_this_year)
+        # print(f"  Year {year}: Allocated={n_allocated}, Available={len(available_ids_year)}, Sampled={len(ids_this_year)}")
+
+
+    final_sampled_ids = list(all_sampled_ids)
+    current_n = len(final_sampled_ids)
+    print(f"Stratified Sampling: Sampled {current_n} unique individuals after initial pass.")
+
+    # Supplement if needed
+    shortfall = target_n_individuals - current_n
+    if shortfall > 0:
+        print(f"Stratified Sampling: Shortfall of {shortfall}. Supplementing...")
+        remaining_ids = df[~df[id_col].isin(final_sampled_ids)][id_col].unique()
+        n_to_add = min(shortfall, len(remaining_ids))
+
+        if n_to_add > 0:
+            # Simple random sampling for supplementation for now
+            # Could enhance this by prioritizing undersampled years or using overall weights
+            supplemental_ids = np.random.choice(remaining_ids, n_to_add, replace=False)
+            final_sampled_ids.extend(supplemental_ids)
+            print(f"Stratified Sampling: Added {n_to_add} supplemental individuals.")
+        else:
+            print("Stratified Sampling: No remaining individuals to supplement with.")
+
+    final_n = len(final_sampled_ids)
+    print(f"Stratified Sampling: Final sample size = {final_n}")
+    return np.array(final_sampled_ids)
+
 
 def preprocess_data():
     """Main function to load, clean, preprocess, split, and save data."""
@@ -324,6 +437,47 @@ def preprocess_data():
     del df_clean
     gc.collect()
 
+    # --- 3.5 Stratified Weighted Sampling for ID Selection ---
+    print("\n===== STEP 3.5: Stratified Weighted Sampling for ID Selection =====")
+    # Perform sampling on the clean train/val pool *before* baking
+    sampled_ids_full = np.array([])
+    if config.PREPROCESS_NUM_INDIVIDUALS_FULL is None or config.PREPROCESS_NUM_INDIVIDUALS_FULL <= 0:
+        print("Sampling FULL: PREPROCESS_NUM_INDIVIDUALS_FULL not set or <= 0. Using all individuals from Train/Val Pool.")
+        sampled_ids_full = train_val_pool_clean[config.GROUP_ID_COL].unique()
+    elif not train_val_pool_clean.empty:
+        print(f"Sampling FULL: Applying stratified weighted sampling for {config.PREPROCESS_NUM_INDIVIDUALS_FULL} individuals.")
+        sampled_ids_full = stratified_weighted_sample(
+            df=train_val_pool_clean,
+            target_n_individuals=config.PREPROCESS_NUM_INDIVIDUALS_FULL,
+            id_col=config.GROUP_ID_COL,
+            weight_col=config.WEIGHT_COL,
+            date_col=config.DATE_COL,
+            random_seed=config.RANDOM_SEED
+        )
+    else:
+        print("Sampling FULL: Train/Val pool is empty. No individuals to sample.")
+
+    sampled_ids_hpt = np.array([])
+    if config.PREPROCESS_NUM_INDIVIDUALS_HPT is None or config.PREPROCESS_NUM_INDIVIDUALS_HPT <= 0:
+        print("Sampling HPT: PREPROCESS_NUM_INDIVIDUALS_HPT not set or <= 0. Using all individuals from Train/Val Pool.")
+        sampled_ids_hpt = train_val_pool_clean[config.GROUP_ID_COL].unique()
+    elif not train_val_pool_clean.empty:
+        print(f"Sampling HPT: Applying stratified weighted sampling for {config.PREPROCESS_NUM_INDIVIDUALS_HPT} individuals.")
+        sampled_ids_hpt = stratified_weighted_sample(
+            df=train_val_pool_clean,
+            target_n_individuals=config.PREPROCESS_NUM_INDIVIDUALS_HPT,
+            id_col=config.GROUP_ID_COL,
+            weight_col=config.WEIGHT_COL,
+            date_col=config.DATE_COL,
+            random_seed=config.RANDOM_SEED # Use same seed for consistency if desired, or different one
+        )
+    else:
+        print("Sampling HPT: Train/Val pool is empty. No individuals to sample.")
+
+    print(f"Selected {len(sampled_ids_full)} individuals for FULL splits.")
+    print(f"Selected {len(sampled_ids_hpt)} individuals for HPT splits.")
+
+
     # --- 4. Handle Sparse Categories (on Train/Val Pool ONLY) ---
     print("\n===== STEP 4: Grouping Sparse Categorical Features (on Train/Val Pool ONLY) =====")
     potential_categorical_features = train_val_pool_clean[predictor_cols].select_dtypes(include=['category', 'object']).columns.tolist()
@@ -456,25 +610,17 @@ def preprocess_data():
     del train_val_pool_clean, hpt_interval_data_clean, test_data_clean
     gc.collect()
 
-    # --- 7. Create FULL Train/Validation Splits (from train_val_pool_baked) ---
-    print("\n===== STEP 7: Creating FULL Train/Validation Splits (from Baked Pool) =====")
-    # This part remains largely the same, but operates on train_val_pool_baked
-    all_person_ids_full_pool = train_val_pool_baked['cpsidp'].unique()
-    n_all_persons_full_pool = len(all_person_ids_full_pool)
-    sampled_ids_full = all_person_ids_full_pool # Default to all
-
-    # Sample individuals if requested and possible
-    num_individuals_full = config.PREPROCESS_NUM_INDIVIDUALS_FULL
-    if num_individuals_full is not None and 0 < num_individuals_full < n_all_persons_full_pool:
-        print(f"Sampling {num_individuals_full} individuals from {n_all_persons_full_pool} for FULL splits...")
-        sampled_ids_full = np.random.choice(all_person_ids_full_pool, num_individuals_full, replace=False)
-        print(f"Selected {len(sampled_ids_full)} individuals.")
-    elif num_individuals_full is not None and num_individuals_full >= n_all_persons_full_pool:
-        print(f"Requested {num_individuals_full} individuals for FULL splits, have {n_all_persons_full_pool}. Using all.")
+    # --- 7. Create FULL Train/Validation Splits (from Baked Pool using Sampled IDs) ---
+    print("\n===== STEP 7: Creating FULL Train/Validation Splits (from Baked Pool using Sampled IDs) =====")
+    # Filter the baked pool to include only the individuals selected in Step 3.5
+    if not train_val_pool_baked.empty and len(sampled_ids_full) > 0:
+        full_sampled_pool_baked = train_val_pool_baked[train_val_pool_baked['cpsidp'].isin(sampled_ids_full)].copy()
+        print(f"Filtered baked pool for FULL splits using {len(sampled_ids_full)} sampled IDs. Shape: {full_sampled_pool_baked.shape}")
     else:
-        print("PREPROCESS_NUM_INDIVIDUALS_FULL not set or <= 0. Using all individuals from Train/Val Pool for FULL splits.")
+        print("Baked pool or sampled IDs for FULL splits is empty. Creating empty dataframes.")
+        full_sampled_pool_baked = pd.DataFrame(columns=train_val_pool_baked.columns) # Empty df with same columns
 
-    n_sampled_persons_full = len(sampled_ids_full)
+    n_sampled_persons_full = len(np.intersect1d(sampled_ids_full, full_sampled_pool_baked['cpsidp'].unique())) # Actual number in the filtered baked data
 
     # Split sampled IDs into Train/Val
     full_train_ids, full_val_ids = np.array([]), np.array([])
@@ -486,52 +632,50 @@ def preprocess_data():
             print(f"Warning: TRAIN_SPLIT ({train_prop}) + VAL_SPLIT ({val_prop}) > 1.0. Adjusting VAL_SPLIT.")
             val_prop = max(0, 1.0 - train_prop)
 
-        train_size_full = int(train_prop * n_sampled_persons_full)
+        # Use the actual number of individuals present in the filtered baked data for splitting
+        ids_to_split = full_sampled_pool_baked['cpsidp'].unique()
+        n_ids_to_split = len(ids_to_split)
+
+        train_size_full = int(train_prop * n_ids_to_split)
         # Calculate val_size based on remaining proportion, ensuring at least 1 if possible
-        val_size_full = n_sampled_persons_full - train_size_full if val_prop > 0 else 0
-        if val_size_full == 0 and train_size_full < n_sampled_persons_full: # Ensure val gets at least 1 if there are leftovers
+        val_size_full = n_ids_to_split - train_size_full if val_prop > 0 else 0
+        if val_size_full == 0 and train_size_full < n_ids_to_split and n_ids_to_split > 1: # Ensure val gets at least 1 if there are leftovers and more than 1 total ID
              val_size_full = 1
-             train_size_full = n_sampled_persons_full - 1 # Adjust train size slightly
+             train_size_full = n_ids_to_split - 1 # Adjust train size slightly
 
         # Use test_size for the validation set size in train_test_split
         if train_size_full > 0 and val_size_full > 0:
-            full_train_ids, full_val_ids = train_test_split(sampled_ids_full, train_size=train_size_full, test_size=val_size_full, random_state=config.RANDOM_SEED)
+            full_train_ids, full_val_ids = train_test_split(ids_to_split, train_size=train_size_full, test_size=val_size_full, random_state=config.RANDOM_SEED)
         elif train_size_full > 0: # Only train set
-             full_train_ids = sampled_ids_full
+             full_train_ids = ids_to_split
         elif val_size_full > 0: # Only val set (unlikely)
-             full_val_ids = sampled_ids_full
+             full_val_ids = ids_to_split
 
         print(f"FULL Individuals Split - Train: {len(full_train_ids)}, Validation: {len(full_val_ids)}")
     else:
-        print("No individuals available for FULL splits.")
+        print("No individuals available in the filtered baked pool for FULL splits.")
 
     # Filter data using isin for efficiency
-    full_train_data_baked = train_val_pool_baked[train_val_pool_baked['cpsidp'].isin(full_train_ids)].copy() if len(full_train_ids) > 0 else pd.DataFrame(columns=train_val_pool_baked.columns)
-    full_val_data_baked = train_val_pool_baked[train_val_pool_baked['cpsidp'].isin(full_val_ids)].copy() if len(full_val_ids) > 0 else pd.DataFrame(columns=train_val_pool_baked.columns)
+    full_train_data_baked = full_sampled_pool_baked[full_sampled_pool_baked['cpsidp'].isin(full_train_ids)].copy() if len(full_train_ids) > 0 else pd.DataFrame(columns=full_sampled_pool_baked.columns)
+    full_val_data_baked = full_sampled_pool_baked[full_sampled_pool_baked['cpsidp'].isin(full_val_ids)].copy() if len(full_val_ids) > 0 else pd.DataFrame(columns=full_sampled_pool_baked.columns)
 
     print(f"Shape of final FULL train data: {full_train_data_baked.shape}")
     print(f"Shape of final FULL val data: {full_val_data_baked.shape}")
+    del full_sampled_pool_baked # Clean up intermediate df
+    gc.collect()
 
 
-    # --- 8. Create HPT Train/Validation Splits (from train_val_pool_baked) ---
-    print("\n===== STEP 8: Creating HPT Train/Validation Splits (from Baked Pool) =====")
-    # This part remains largely the same, but operates on train_val_pool_baked
-    all_person_ids_hpt_pool = all_person_ids_full_pool # Use same pool as FULL
-    n_all_persons_hpt_pool = len(all_person_ids_hpt_pool)
-    sampled_ids_hpt = all_person_ids_hpt_pool # Default to all
-
-    # Sample individuals if requested and possible
-    num_individuals_hpt = config.PREPROCESS_NUM_INDIVIDUALS_HPT
-    if num_individuals_hpt is not None and 0 < num_individuals_hpt < n_all_persons_hpt_pool:
-        print(f"Sampling {num_individuals_hpt} individuals from {n_all_persons_hpt_pool} available in the pool for HPT splits...")
-        sampled_ids_hpt = np.random.choice(all_person_ids_hpt_pool, num_individuals_hpt, replace=False)
-        print(f"Selected {len(sampled_ids_hpt)} individuals.")
-    elif num_individuals_hpt is not None and num_individuals_hpt >= n_all_persons_hpt_pool:
-        print(f"Requested {num_individuals_hpt} individuals for HPT splits, have {n_all_persons_hpt_pool}. Using all.")
+    # --- 8. Create HPT Train/Validation Splits (from Baked Pool using Sampled IDs) ---
+    print("\n===== STEP 8: Creating HPT Train/Validation Splits (from Baked Pool using Sampled IDs) =====")
+    # Filter the baked pool to include only the individuals selected in Step 3.5
+    if not train_val_pool_baked.empty and len(sampled_ids_hpt) > 0:
+        hpt_sampled_pool_baked = train_val_pool_baked[train_val_pool_baked['cpsidp'].isin(sampled_ids_hpt)].copy()
+        print(f"Filtered baked pool for HPT splits using {len(sampled_ids_hpt)} sampled IDs. Shape: {hpt_sampled_pool_baked.shape}")
     else:
-        print("PREPROCESS_NUM_INDIVIDUALS_HPT not set or <= 0. Using all individuals from the pool for HPT splits.")
+        print("Baked pool or sampled IDs for HPT splits is empty. Creating empty dataframes.")
+        hpt_sampled_pool_baked = pd.DataFrame(columns=train_val_pool_baked.columns) # Empty df with same columns
 
-    n_sampled_persons_hpt = len(sampled_ids_hpt)
+    n_sampled_persons_hpt = len(np.intersect1d(sampled_ids_hpt, hpt_sampled_pool_baked['cpsidp'].unique())) # Actual number in the filtered baked data
 
     # Split sampled IDs into Train/Val (using same logic as FULL splits)
     hpt_train_ids, hpt_val_ids = np.array([]), np.array([])
@@ -540,27 +684,33 @@ def preprocess_data():
         val_prop = config.VAL_SPLIT
         if train_prop + val_prop > 1.0: val_prop = max(0, 1.0 - train_prop) # Adjust val_prop if needed
 
-        train_size_hpt = int(train_prop * n_sampled_persons_hpt)
-        val_size_hpt = n_sampled_persons_hpt - train_size_hpt if val_prop > 0 else 0
-        if val_size_hpt == 0 and train_size_hpt < n_sampled_persons_hpt: # Ensure val gets at least 1 if possible
+        # Use the actual number of individuals present in the filtered baked data for splitting
+        ids_to_split_hpt = hpt_sampled_pool_baked['cpsidp'].unique()
+        n_ids_to_split_hpt = len(ids_to_split_hpt)
+
+        train_size_hpt = int(train_prop * n_ids_to_split_hpt)
+        val_size_hpt = n_ids_to_split_hpt - train_size_hpt if val_prop > 0 else 0
+        if val_size_hpt == 0 and train_size_hpt < n_ids_to_split_hpt and n_ids_to_split_hpt > 1: # Ensure val gets at least 1 if possible
              val_size_hpt = 1
-             train_size_hpt = n_sampled_persons_hpt - 1
+             train_size_hpt = n_ids_to_split_hpt - 1
 
         if train_size_hpt > 0 and val_size_hpt > 0:
-            hpt_train_ids, hpt_val_ids = train_test_split(sampled_ids_hpt, train_size=train_size_hpt, test_size=val_size_hpt, random_state=config.RANDOM_SEED)
-        elif train_size_hpt > 0: hpt_train_ids = sampled_ids_hpt
-        elif val_size_hpt > 0: hpt_val_ids = sampled_ids_hpt
+            hpt_train_ids, hpt_val_ids = train_test_split(ids_to_split_hpt, train_size=train_size_hpt, test_size=val_size_hpt, random_state=config.RANDOM_SEED)
+        elif train_size_hpt > 0: hpt_train_ids = ids_to_split_hpt
+        elif val_size_hpt > 0: hpt_val_ids = ids_to_split_hpt
 
         print(f"HPT Individuals Split - Train: {len(hpt_train_ids)}, Validation: {len(hpt_val_ids)}")
     else:
-        print("No individuals available for HPT splits.")
+        print("No individuals available in the filtered baked pool for HPT splits.")
 
-    # Filter data from the train_val_pool_baked
-    hpt_train_data_baked = train_val_pool_baked[train_val_pool_baked['cpsidp'].isin(hpt_train_ids)].copy() if len(hpt_train_ids) > 0 else pd.DataFrame(columns=train_val_pool_baked.columns)
-    hpt_val_data_baked = train_val_pool_baked[train_val_pool_baked['cpsidp'].isin(hpt_val_ids)].copy() if len(hpt_val_ids) > 0 else pd.DataFrame(columns=train_val_pool_baked.columns)
+    # Filter data from the hpt_sampled_pool_baked
+    hpt_train_data_baked = hpt_sampled_pool_baked[hpt_sampled_pool_baked['cpsidp'].isin(hpt_train_ids)].copy() if len(hpt_train_ids) > 0 else pd.DataFrame(columns=hpt_sampled_pool_baked.columns)
+    hpt_val_data_baked = hpt_sampled_pool_baked[hpt_sampled_pool_baked['cpsidp'].isin(hpt_val_ids)].copy() if len(hpt_val_ids) > 0 else pd.DataFrame(columns=hpt_sampled_pool_baked.columns)
 
     print(f"Shape of final HPT train data: {hpt_train_data_baked.shape}")
     print(f"Shape of final HPT val data: {hpt_val_data_baked.shape}")
+    del hpt_sampled_pool_baked # Clean up intermediate df
+    gc.collect()
 
     # Clean up pool
     del train_val_pool_baked # Now delete the baked pool

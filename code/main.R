@@ -88,6 +88,23 @@ if (exit_code != 0) {
   message("Model pipeline script executed successfully.")
 }
 
+# --- 5.1 Run Plotting Script ---
+message("\n--- Running Plotting Script (code/plot/plot_forecast.R) ---")
+plot_script_path <- here::here("code", "plot", "plot_forecast.R")
+if (!file.exists(plot_script_path)) {
+  warning("Plotting script not found, skipping: ", plot_script_path) # Warning instead of stop? Or stop? User decision. Let's warn for now.
+} else {
+  tryCatch({
+    message("Attempting to source: ", plot_script_path)
+    source(plot_script_path, chdir = TRUE) # chdir=TRUE runs script relative to its own dir
+    message("Plotting script sourced successfully.")
+  }, error = function(e) {
+    message("Error occurred while sourcing ", plot_script_path, ":")
+    message(e$message)
+    warning("Plotting script failed during sourcing.") # Warning instead of stop
+  })
+}
+
 # --- 6. Completion ---
 end_time <- Sys.time()
 elapsed_total <- difftime(end_time, start_time, units = "mins")

@@ -3,6 +3,7 @@ import pickle
 import optuna
 import torch
 import torch.nn as nn
+import torch.nn.functional as F # Import functional
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
@@ -12,33 +13,91 @@ import multiprocessing
 import traceback
 import gc
 
+# --- Project Imports --- # Add this section
+import config # Add this line
+
 # Assuming utils.py contains get_device, SequenceDataset, worker_init_fn, stop_training_flag
 from utils import get_device, SequenceDataset, worker_init_fn, stop_training_flag
 # Assuming models.py contains the model definition
 from models import TransformerForecastingModel
 
+# --- Focal Loss Implementation ---
+class FocalLoss(nn.Module):
+    """
+    Focal Loss implementation.
+    Handles logits input. Assumes reduction is handled outside or set during init.
+    gamma > 0 reduces the relative loss for well-classified examples (pt > 0.5),
+    putting more focus on hard, misclassified examples.
+    """
+    def __init__(self, gamma=2.0, reduction='mean'): # Removed alpha
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        # Removed alpha handling
+
+    def forward(self, inputs, targets):
+        # inputs are expected to be logits (N, C)
+        # targets are expected to be class indices (N,)
+
+        # Calculate Cross Entropy loss without reduction
+        # NOTE: Always use reduction='none' here as weighting/reduction is handled outside
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+
+        # Calculate pt (probability of the true class)
+        pt = torch.exp(-ce_loss)
+
+        # Calculate Focal Loss component
+        focal_term = (1 - pt)**self.gamma
+        loss = focal_term * ce_loss
+
+        # Removed alpha weighting section
+
+        # Apply reduction based on init parameter
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else: # 'none' or invalid
+            return loss # Return per-sample loss if reduction is 'none'
+
 # --- Training and Evaluation Functions (during training loop) ---
 def train_epoch(model, dataloader, criterion, optimizer, device, max_grad_norm):
-    """Trains the model for one epoch."""
+    """
+    Trains the model for one epoch using sample weights.
+    Assumes criterion has reduction='none'.
+    """
     model.train()
     total_loss = 0.0
     correct_predictions = 0
     total_samples = 0
+    sum_sample_weights = 0.0 # For potential weighted accuracy/loss normalization
 
     # Disable tqdm progress bar if not in the main process
     is_main_process = multiprocessing.current_process().name == 'MainProcess'
     data_iterator = tqdm(dataloader, desc="Training", leave=False, disable=not is_main_process)
 
-    for x_batch, y_batch, _, mask_batch in data_iterator: # Weight (w_batch) is unused here
+    # Expect sample_weight_batch as the 3rd element
+    for x_batch, y_batch, sample_weight_batch, mask_batch in data_iterator:
         if stop_training_flag:
             print("Stop signal detected during training batch iteration.")
             break # Exit the inner loop
 
         x_batch, y_batch, mask_batch = x_batch.to(device), y_batch.to(device), mask_batch.to(device)
+        sample_weight_batch = sample_weight_batch.to(device) # Move weights to device
 
         optimizer.zero_grad()
         outputs = model(x_batch, src_key_padding_mask=mask_batch) # Pass padding mask
-        loss = criterion(outputs, y_batch) # Loss calculation uses weights if criterion was initialized with them
+
+        # Calculate per-sample loss (criterion should have reduction='none')
+        loss_per_sample = criterion(outputs, y_batch)
+
+        # Apply sample weights
+        weighted_loss = loss_per_sample * sample_weight_batch
+
+        # Calculate the mean loss for the batch
+        loss = weighted_loss.mean()
+
+        # Backpropagate the mean weighted loss
         loss.backward()
 
         # Gradient clipping
@@ -48,15 +107,19 @@ def train_epoch(model, dataloader, criterion, optimizer, device, max_grad_norm):
         optimizer.step()
 
         batch_size = x_batch.size(0)
-        total_loss += loss.item() # Aggregate base loss value
+        # Aggregate the *mean* batch loss, weighted by batch size for overall average
+        total_loss += loss.item() * batch_size
         _, predicted = torch.max(outputs.data, 1)
         total_samples += batch_size
         correct_predictions += (predicted == y_batch).sum().item()
+        sum_sample_weights += sample_weight_batch.sum().item() # Sum weights in batch
 
         # Update tqdm description dynamically in the main process
         if is_main_process and total_samples > 0:
-             current_loss = total_loss / total_samples # Average loss per sample so far
+             # Report average loss per sample so far
+             current_loss = total_loss / total_samples
              current_acc = correct_predictions / total_samples
+             # Optionally report weighted loss avg: total_loss / sum_sample_weights
              data_iterator.set_postfix({"loss": f"{current_loss:.4f}", "acc": f"{current_acc:.4f}"})
 
     if stop_training_flag: return float('nan'), float('nan') # Return NaN if interrupted
@@ -64,14 +127,20 @@ def train_epoch(model, dataloader, criterion, optimizer, device, max_grad_norm):
     # Avoid division by zero if epoch finishes with no samples
     if total_samples == 0: return 0.0, 0.0
 
-    avg_loss = total_loss / total_samples # Final average loss for the epoch
+    # Final average loss for the epoch (mean of mean batch losses)
+    avg_loss = total_loss / total_samples
     accuracy = correct_predictions / total_samples
+    # avg_weighted_loss = total_loss / sum_sample_weights if sum_sample_weights > 0 else 0.0
     return avg_loss, accuracy
 
 def evaluate_epoch(model, dataloader, criterion, device):
-    """Evaluates the model for one epoch (e.g., on validation set)."""
+    """
+    Evaluates the model for one epoch (e.g., on validation set).
+    Calculates standard unweighted loss and accuracy.
+    Assumes criterion has reduction='none'.
+    """
     model.eval()
-    total_loss = 0.0
+    total_loss = 0.0 # Unweighted loss
     correct_predictions = 0
     total_samples = 0
     all_preds = []
@@ -81,7 +150,8 @@ def evaluate_epoch(model, dataloader, criterion, device):
     data_iterator = tqdm(dataloader, desc="Evaluating", leave=False, disable=not is_main_process)
 
     with torch.no_grad():
-        for x_batch, y_batch, _, mask_batch in data_iterator: # Weight (w_batch) is unused here
+        # Expect sample_weight_batch as the 3rd element, but ignore it here
+        for x_batch, y_batch, _, mask_batch in data_iterator:
              if stop_training_flag:
                  print("Stop signal detected during evaluation iteration.")
                  break
@@ -89,14 +159,20 @@ def evaluate_epoch(model, dataloader, criterion, device):
              x_batch, y_batch, mask_batch = x_batch.to(device), y_batch.to(device), mask_batch.to(device)
 
              outputs = model(x_batch, src_key_padding_mask=mask_batch) # Pass padding mask
-             
-             loss = criterion(outputs, y_batch) # Calculate loss *after* printing shapes
-             if total_samples == 0:
-                 print(f"  Calculated loss: {loss.item():.6f}")
+
+             # Calculate per-sample loss (criterion has reduction='none')
+             loss_per_sample = criterion(outputs, y_batch)
+             # Calculate the unweighted mean loss for the batch
+             loss = loss_per_sample.mean()
+
+             # --- Diagnostic Print (Optional) ---
+             # if total_samples == 0:
+             #     print(f"  Eval Batch Loss (unweighted mean): {loss.item():.6f}")
              # --- END DIAGNOSTIC PRINTS ---
 
              batch_size = x_batch.size(0)
-             total_loss += loss.item() # Aggregate base loss value
+             # Aggregate unweighted batch loss
+             total_loss += loss.item() * batch_size
              _, predicted = torch.max(outputs.data, 1)
              total_samples += batch_size
              correct_predictions += (predicted == y_batch).sum().item()
@@ -105,7 +181,7 @@ def evaluate_epoch(model, dataloader, criterion, device):
 
              # Update tqdm description dynamically
              if is_main_process and total_samples > 0:
-                 current_loss = total_loss / total_samples
+                 current_loss = total_loss / total_samples # Avg unweighted loss
                  current_acc = correct_predictions / total_samples
                  data_iterator.set_postfix({"loss": f"{current_loss:.4f}", "acc": f"{current_acc:.4f}"})
 
@@ -115,13 +191,15 @@ def evaluate_epoch(model, dataloader, criterion, device):
          print("Warning: Evaluation completed with zero samples.")
          return float('nan'), float('nan'), np.array([]), np.array([])
 
-    avg_loss = total_loss / total_samples
+    avg_loss = total_loss / total_samples # Final avg unweighted loss
     accuracy = correct_predictions / total_samples
     return avg_loss, accuracy, np.array(all_targets), np.array(all_preds)
 
 
-def create_dataloaders(x_train_np, y_train_np, weight_train_np, x_val_np, y_val_np, weight_val_np, hparams, device, parallel_workers):
-    """Creates Datasets and DataLoaders for training and validation."""
+def create_dataloaders(x_train_np, y_train_np, sample_weights_train_np, # Renamed weight_train_np
+                       x_val_np, y_val_np, sample_weights_val_np, # Renamed weight_val_np
+                       hparams, device, parallel_workers):
+    """Creates Datasets and DataLoaders for training and validation using sample weights.""" # Docstring updated
     print("\nCreating PyTorch Datasets and DataLoaders...")
     batch_size = hparams['batch_size']
     pad_value = hparams['pad_value']
@@ -131,8 +209,9 @@ def create_dataloaders(x_train_np, y_train_np, weight_train_np, x_val_np, y_val_
          if x_train_np.shape[0] == 0: raise ValueError("Training data (x_train_np) is empty.")
          if x_val_np.shape[0] == 0: raise ValueError("Validation data (x_val_np) is empty.")
 
-         train_dataset = SequenceDataset(x_train_np, y_train_np, weight_train_np, pad_value)
-         val_dataset = SequenceDataset(x_val_np, y_val_np, weight_val_np, pad_value)
+         # Pass sample weights to SequenceDataset
+         train_dataset = SequenceDataset(x_train_np, y_train_np, sample_weights_train_np, pad_value)
+         val_dataset = SequenceDataset(x_val_np, y_val_np, sample_weights_val_np, pad_value)
          print(f"Created Train Dataset ({len(train_dataset)} samples), Validation Dataset ({len(val_dataset)} samples)")
     except Exception as e:
          print(f"ERROR creating SequenceDataset objects: {e}")
@@ -207,7 +286,8 @@ def build_model(hparams, n_features, n_classes, device):
 def run_training_loop(model, train_loader, val_loader, criterion, optimizer, scheduler, hparams, device, checkpoint_path, trial=None):
     """
     Runs the main training loop with validation, checkpointing, early stopping, and Optuna pruning.
-    Uses the provided criterion (potentially with class weights).
+    Uses the provided criterion (assumed to have reduction='none' for training).
+    Validation loss is calculated as unweighted mean.
     """
     print("\n===== STEP 4: Training the Model =====")
     epochs = hparams['epochs']
@@ -221,8 +301,15 @@ def run_training_loop(model, train_loader, val_loader, criterion, optimizer, sch
     last_epoch = 0 # Track the last epoch number completed
 
     print(f"Starting training loop: Max epochs={epochs}, Batch size={hparams['batch_size']}, LR={hparams['learning_rate']:.6f}")
+    print(f"Using sample weights for training loss (Factor: {hparams.get('transition_weight_factor', config.TRANSITION_WEIGHT_FACTOR):.2f}).")
+    print(f"Using FocalLoss gamma: {hparams.get('focal_loss_gamma', config.FOCAL_LOSS_GAMMA):.2f}.")
     print(f"Early stopping patience: {early_stopping_patience} epochs")
     print(f"Best model checkpoint path: {checkpoint_path}")
+
+    # --- Create separate criterion for evaluation with mean reduction ---
+    # This avoids issues if the main criterion instance is modified
+    eval_criterion = FocalLoss(gamma=criterion.gamma, reduction='mean').to(device)
+
 
     for epoch in range(epochs):
         last_epoch = epoch
@@ -234,6 +321,7 @@ def run_training_loop(model, train_loader, val_loader, criterion, optimizer, sch
             break
 
         # --- Training Step ---
+        # train_epoch now handles sample weighting internally using the main criterion (reduction='none')
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, max_grad_norm)
 
         if stop_training_flag or np.isnan(train_loss): # Check for interruption or NaN loss
@@ -244,12 +332,13 @@ def run_training_loop(model, train_loader, val_loader, criterion, optimizer, sch
             break
 
         # --- Validation Step ---
-        val_loss, val_acc, _, _ = evaluate_epoch(model, val_loader, criterion, device)
+        # evaluate_epoch calculates unweighted loss using the eval_criterion (reduction='mean')
+        val_loss, val_acc, _, _ = evaluate_epoch(model, val_loader, eval_criterion, device)
         epoch_end_time = time.time()
 
         print(f"Epoch {epoch+1}/{epochs} | Time: {epoch_end_time - epoch_start_time:.2f}s | "
-              f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | "
-              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f} | "
+              f"Train Loss (Avg Wtd): {train_loss:.4f}, Train Acc: {train_acc:.4f} | " # Clarify Train Loss is weighted avg
+              f"Val Loss (Unwtd): {val_loss:.4f}, Val Acc: {val_acc:.4f} | " # Clarify Val Loss is unweighted avg
               f"LR: {optimizer.param_groups[0]['lr']:.7f}")
 
         history['loss'].append(train_loss); history['accuracy'].append(train_acc)
@@ -261,10 +350,10 @@ def run_training_loop(model, train_loader, val_loader, criterion, optimizer, sch
             epochs_no_improve += 1
         else:
             # --- Learning Rate Scheduler Step ---
-            scheduler.step(val_loss)
+            scheduler.step(val_loss) # Step based on unweighted validation loss
 
             # --- Checkpointing ---
-            if val_loss < best_val_loss:
+            if val_loss < best_val_loss: # Checkpoint based on unweighted validation loss
                 best_val_loss = val_loss
                 epochs_no_improve = 0
                 try:
@@ -278,7 +367,7 @@ def run_training_loop(model, train_loader, val_loader, criterion, optimizer, sch
 
         # --- Optuna Pruning Check ---
         if trial:
-            # Report the standard validation loss for pruning
+            # Report the unweighted validation loss for pruning
             trial.report(val_loss if not np.isnan(val_loss) else float('inf'), epoch) # Report inf if NaN
             if trial.should_prune():
                 print(f"Trial pruned at epoch {epoch+1} based on intermediate validation loss.")

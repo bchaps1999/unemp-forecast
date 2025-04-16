@@ -16,6 +16,12 @@ from functools import partial
 from tqdm import tqdm
 import traceback
 import sys
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from joblib import Parallel, delayed, dump, load
+from collections import Counter # Import Counter for frequency calculation
 
 # --- Global flag for graceful exit ---
 stop_training_flag = False
@@ -180,39 +186,39 @@ def generate_sequences_py(baked_data: pd.DataFrame, group_col: str, date_col: st
 
 # --- PyTorch Dataset ---
 class SequenceDataset(Dataset):
-    """PyTorch Dataset for sequence data with padding masks."""
-    def __init__(self, x_data, y_data, weight_data, pad_value):
-        if not all(isinstance(arr, np.ndarray) for arr in [x_data, y_data, weight_data]):
-             raise TypeError("Input data must be NumPy arrays")
-        if not (x_data.shape[0] == y_data.shape[0] == weight_data.shape[0]):
-             raise ValueError("Input arrays (x, y, weight) must have the same number of samples")
+    """
+    PyTorch Dataset for sequence data.
+    Returns sequence (X), target (y), sample_weight, and padding mask.
+    """
+    def __init__(self, sequences, targets, sample_weights, pad_value):
+        self.sequences = torch.tensor(sequences, dtype=torch.float32)
+        self.targets = torch.tensor(targets, dtype=torch.long)
+        # Ensure sample_weights is always present and float32
+        if sample_weights is None:
+            self.sample_weights = torch.ones(len(sequences), dtype=torch.float32)
+            print("Warning: sample_weights were None, initialized to ones.")
+        else:
+            self.sample_weights = torch.tensor(sample_weights, dtype=torch.float32)
 
-        # Convert NumPy arrays to PyTorch tensors
-        self.x_data = torch.from_numpy(x_data.astype(np.float32))
-        self.y_data = torch.from_numpy(y_data.astype(np.int64)) # Targets as Long
-        self.weight_data = torch.from_numpy(weight_data.astype(np.float32))
         self.pad_value = pad_value
-        self.seq_len = x_data.shape[1]
+        # Create padding mask (True where padded)
+        # Assumes padding is only in the sequence dimension (dim=1)
+        # Check across all features (dim=2) if ANY feature is pad_value
+        self.padding_mask = (self.sequences == pad_value).any(dim=2)
+
+        # --- Input Validation ---
+        if not (len(self.sequences) == len(self.targets) == len(self.sample_weights)):
+             raise ValueError(f"Mismatch in lengths: sequences ({len(self.sequences)}), targets ({len(self.targets)}), sample_weights ({len(self.sample_weights)})")
+        if len(self.sequences) == 0:
+             print("Warning: SequenceDataset created with 0 samples.")
+
 
     def __len__(self):
-        return len(self.x_data)
+        return len(self.targets)
 
     def __getitem__(self, idx):
-        x = self.x_data[idx]
-        y = self.y_data[idx]
-        w = self.weight_data[idx]
-
-        # Create padding mask: True for padded time steps, False for real data
-        # Mask shape: (seq_len,) for transformer's src_key_padding_mask
-        # A time step is padded if ALL features at that step match the pad_value
-        padding_mask = torch.all(x == self.pad_value, dim=-1) # Check across feature dimension
-
-        # Ensure mask has the correct shape (defensive check)
-        if padding_mask.shape != (self.seq_len,):
-             print(f"Warning: Unexpected padding mask shape {padding_mask.shape} for index {idx}. Expected ({self.seq_len},). Creating default mask.")
-             padding_mask = torch.zeros(self.seq_len, dtype=torch.bool) # Default to no padding
-
-        return x, y, w, padding_mask # Return sequence, target, weight, mask
+        # Return sequence, target, sample_weight, and mask
+        return self.sequences[idx], self.targets[idx], self.sample_weights[idx], self.padding_mask[idx]
 
 # --- Data Loading and Preparation ---
 def load_and_prepare_data(train_file: Path, val_file: Path, hpt_val_file: Path, metadata_file: Path, date_col: str, group_id_col: str):

@@ -9,8 +9,6 @@ import time
 from datetime import datetime
 import random
 from pathlib import Path
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from tqdm import tqdm
 import math
 import sys
@@ -23,6 +21,17 @@ from utils import get_device, SequenceDataset, period_to_date, worker_init_fn
 from models import TransformerForecastingModel
 # Assuming config.py contains necessary constants
 import config
+
+# --- Helper: Map Group IDs to Integers ---
+def map_group_ids_to_int(group_series: pd.Series):
+    """Maps unique group IDs from a pandas Series to contiguous integers (0 to N-1)."""
+    unique_groups = group_series.unique()
+    group_to_int_map = {group: i for i, group in enumerate(unique_groups)}
+    int_ids = group_series.map(group_to_int_map).values
+    num_groups = len(unique_groups)
+    print(f"Mapped {len(group_series)} group IDs to {num_groups} unique integer indices.")
+    return torch.tensor(int_ids, dtype=torch.long), num_groups, group_to_int_map
+
 
 # --- Loading Functions ---
 def load_pytorch_model_and_params(model_dir: Path, processed_data_dir: Path, device):
@@ -84,24 +93,23 @@ def load_pytorch_model_and_params(model_dir: Path, processed_data_dir: Path, dev
 
     return model, params, metadata
 
-def load_forecasting_data(processed_data_dir: Path, metadata: dict, start_year: int = None, start_month: int = None):
-    """Loads the TEST baked data (which includes lookback history) for simulation start.
-       Filters data based on specified start_year and start_month if provided,
-       otherwise uses the EARLIEST period in the test set's actual forecast range.
+def load_forecasting_data(processed_data_dir: Path, metadata: dict):
+    """Loads the FULL TEST baked data (which includes lookback history).
+       Returns the full dataframe and the list of available forecast start periods.
     """
-    print("Loading data for forecasting initialization...")
+    print("Loading FULL test data for forecasting initialization...")
     # --- Load TEST Baked Data (includes history) ---
     test_baked_path = processed_data_dir / config.TEST_DATA_FILENAME
     if not test_baked_path.exists():
          raise FileNotFoundError(f"Required test data file not found at {test_baked_path}. Please ensure the preprocessing script ran successfully and saved the file.")
 
-    print(f"Loading TEST baked data from: {test_baked_path}")
+    print(f"Loading FULL TEST baked data from: {test_baked_path}")
     try:
-        test_data_df = pd.read_parquet(test_baked_path) # Renamed variable
+        test_data_df = pd.read_parquet(test_baked_path)
     except Exception as e:
         print(f"Error loading Parquet file {test_baked_path}: {e}")
         raise
-    print(f"Loaded TEST baked data (including history): {test_data_df.shape}")
+    print(f"Loaded FULL TEST baked data (including history): {test_data_df.shape}")
     if test_data_df.empty:
         raise ValueError("Test data file is empty. Cannot initialize forecast.")
     # --- End Load Baked Data ---
@@ -129,37 +137,10 @@ def load_forecasting_data(processed_data_dir: Path, metadata: dict, start_year: 
     if not available_periods:
         raise ValueError(f"No periods found in the loaded test data on or after the expected test start period {actual_test_start_period}.")
 
-    # Determine the simulation start period
-    if start_year and start_month:
-        start_period = start_year * 100 + start_month
-        if start_period not in available_periods:
-             raise ValueError(f"Specified start period {start_period} ({start_year}-{start_month:02d}) not found in the test data's forecast range. Available periods range from {min(available_periods)} to {max(available_periods)}.")
-        print(f"Using specified start period from test data: {start_period}")
-    else:
-        start_period = available_periods[0] # Use the EARLIEST period in the test set's forecast range
-        start_date = period_to_date(start_period)
-        print(f"Using earliest period in test data's forecast range as start period: {start_period} ({start_date.strftime('%Y-%m') if start_date else 'Invalid Date'})")
+    print(f"Available forecast start periods in test data: {available_periods}")
 
-    # Get individuals present in the simulation start period
-    start_period_ids = test_data_df[test_data_df['period'] == start_period][config.GROUP_ID_COL].unique()
-    if len(start_period_ids) == 0:
-        raise ValueError(f"No individuals found in the specified start period {start_period} within the test data.")
-    print(f"Found {len(start_period_ids)} unique individuals present in the start period ({start_period}).")
-
-    # Filter the loaded test_data_df to include history *up to* the start period for these individuals
-    initial_sim_data = test_data_df[
-        (test_data_df[config.GROUP_ID_COL].isin(start_period_ids)) &
-        (test_data_df['period'] <= start_period)
-    ].sort_values([config.GROUP_ID_COL, config.DATE_COL]) # Sort is important
-
-    # --- Delete the loaded dataframe if no longer needed (initial_sim_data is a slice/copy) ---
-    del test_data_df
-    gc.collect()
-    print("Released memory from the loaded test dataframe.")
-    # ---
-
-    # Return the filtered data containing history + start period state
-    return initial_sim_data, start_period, start_period_ids
+    # Return the full dataframe and the list of available periods
+    return test_data_df, available_periods
 
 def get_sequences_for_simulation(sim_data_df: pd.DataFrame, group_col: str, seq_len: int, features: list, original_id_cols: list, pad_val: float, end_period: int):
     """
@@ -350,53 +331,58 @@ def sample_states_and_calc_rates(probabilities: torch.Tensor, # Shape (N, C) on 
     return sampled_states_gpu, weighted_unemp_rate.item(), weighted_emp_rate.item() # Return rates as floats
 
 
-def calculate_group_rates(sampled_states_np: np.ndarray, # Shape (n_individuals,) on CPU
-                          grouping_series: pd.Series, # Series with group IDs (statefip or ind_group_cat), index matching sampled_states
-                          weights_series: pd.Series, # Series with weights, index matching sampled_states
-                          target_map_inverse: dict):
-    """Calculates WEIGHTED unemployment and employment rates for each group."""
-    if grouping_series is None or grouping_series.empty:
-        print("Warning: Grouping series is empty, cannot calculate group rates.")
-        return {}
-    if weights_series is None or weights_series.empty:
-        print("Warning: Weights series is empty, cannot calculate weighted group rates.")
-        return {}
-    if len(sampled_states_np) != len(grouping_series) or len(sampled_states_np) != len(weights_series):
-        print(f"Warning: Length mismatch between states ({len(sampled_states_np)}), group IDs ({len(grouping_series)}), or weights ({len(weights_series)}). Cannot calculate group rates.")
-        return {}
+# --- New Tensor-Based Group Rate Calculation ---
+def calculate_group_rates_tensor(sampled_states_gpu: torch.Tensor, # Shape (N,) on GPU
+                                 weights_gpu: torch.Tensor, # Shape (N,) on GPU
+                                 group_ids_int_gpu: torch.Tensor, # Shape (N,) integer group IDs on GPU
+                                 num_groups: int,
+                                 metadata: dict):
+    """Calculates WEIGHTED unemployment and employment rates for each group using tensor ops."""
+    device = sampled_states_gpu.device
+    target_map_inverse = metadata.get('target_state_map_inverse', {})
 
-    # --- Find integer indices for Employed and Unemployed states ---
+    # Find integer indices for Employed and Unemployed states
     try:
         employed_int = next(k for k, v in target_map_inverse.items() if v.lower() == 'employed')
         unemployed_int = next(k for k, v in target_map_inverse.items() if v.lower() == 'unemployed')
     except StopIteration:
-        raise ValueError("Metadata missing required state definitions ('employed', 'unemployed') in target_state_map_inverse for group rate calculation")
+        raise ValueError("Metadata missing required state definitions ('employed', 'unemployed') for group rate calculation")
 
-    # Create a DataFrame for calculation
-    df = pd.DataFrame({
-        'group': grouping_series.values, # Use .values to ensure alignment if index is different
-        'state': sampled_states_np,
-        'weight': weights_series.values
-    })
+    # Masks for employment status
+    employed_mask = (sampled_states_gpu == employed_int)
+    unemployed_mask = (sampled_states_gpu == unemployed_int)
 
-    # Calculate weighted counts for each state within each group
-    df['is_employed'] = (df['state'] == employed_int)
-    df['is_unemployed'] = (df['state'] == unemployed_int)
+    # Calculate weighted sums per group using torch.bincount
+    # Ensure weights are float32 for bincount
+    weights_float_gpu = weights_gpu.float()
 
-    group_weights = df.groupby('group').agg(
-        employed_weight=('weight', lambda x: x[df.loc[x.index, 'is_employed']].sum()),
-        unemployed_weight=('weight', lambda x: x[df.loc[x.index, 'is_unemployed']].sum())
+    # Sum of weights for employed individuals in each group
+    employed_weight_per_group = torch.bincount(
+        group_ids_int_gpu[employed_mask],
+        weights=weights_float_gpu[employed_mask],
+        minlength=num_groups
     )
 
-    # Calculate rates
-    labor_force_weight = group_weights['employed_weight'] + group_weights['unemployed_weight']
+    # Sum of weights for unemployed individuals in each group
+    unemployed_weight_per_group = torch.bincount(
+        group_ids_int_gpu[unemployed_mask],
+        weights=weights_float_gpu[unemployed_mask],
+        minlength=num_groups
+    )
 
-    rates_df = pd.DataFrame(index=group_weights.index)
-    rates_df['unemp_rate'] = np.where(labor_force_weight > 0, group_weights['unemployed_weight'] / labor_force_weight, 0.0)
-    rates_df['emp_rate'] = np.where(labor_force_weight > 0, group_weights['employed_weight'] / labor_force_weight, 0.0) # Emp / LF
+    # Calculate labor force weight per group
+    labor_force_weight_per_group = employed_weight_per_group + unemployed_weight_per_group
 
-    # Convert to dictionary: {group_id: {'unemp_rate': x, 'emp_rate': y}}
-    return rates_df.to_dict(orient='index')
+    # Calculate rates, handle division by zero
+    # Add small epsilon to denominator to avoid NaN from 0/0, result will be 0 anyway.
+    epsilon = 1e-9
+    unemp_rate_per_group = unemployed_weight_per_group / (labor_force_weight_per_group + epsilon)
+    emp_rate_per_group = employed_weight_per_group / (labor_force_weight_per_group + epsilon) # Emp / LF
+
+    # Stack rates into a tensor: shape (num_groups, 2) -> [unemp_rate, emp_rate]
+    group_rates_tensor = torch.stack([unemp_rate_per_group, emp_rate_per_group], dim=1)
+
+    return group_rates_tensor # Return tensor on GPU
 
 
 # --- Helper: Find feature indices ---
@@ -417,6 +403,9 @@ def _find_feature_indices(feature_names, target_map_inverse):
         indices['age_idx'] = feature_names.index('num__age') if 'num__age' in feature_names else -1
         indices['months_last_idx'] = feature_names.index('num__months_since_last_observation') if 'num__months_since_last_observation' in feature_names else -1
         indices['durunemp_idx'] = feature_names.index('num__duration_unemployed') if 'num__duration_unemployed' in feature_names else -1
+        # Add month cyclical features
+        indices['mth_dim1_idx'] = feature_names.index('num__mth_dim1') if 'num__mth_dim1' in feature_names else -1
+        indices['mth_dim2_idx'] = feature_names.index('num__mth_dim2') if 'num__mth_dim2' in feature_names else -1
 
         # Aggregate rate features
         indices['nat_unemp_idx'] = feature_names.index('num__national_unemployment_rate') if 'num__national_unemployment_rate' in feature_names else -1
@@ -444,208 +433,165 @@ def _find_feature_indices(feature_names, target_map_inverse):
 
     return indices
 
-# --- Helper: Lookback for categorical features ---
-def _find_last_valid_category_index(sequence_history_np: np.ndarray, # Shape (seq_len, n_features)
-                                   group_indices: dict, # {feature_name: index}
-                                   unknown_indices: set): # {index_of_unknown, index_of_niu, ...}
-    """Looks back in time (excluding the last step) to find the last non-unknown category."""
-    last_valid_idx = -1
-    seq_len = sequence_history_np.shape[0]
-    # Look backwards from the second-to-last time step (index seq_len - 2) down to 0
-    for t in range(seq_len - 2, -1, -1):
-        step_features = sequence_history_np[t, :]
-        # Check if any category in this group was active (value > 0.5 for robustness)
-        active_indices_in_group = [idx for idx in group_indices.values() if step_features[idx] > 0.5]
-        if active_indices_in_group:
-            # Found an active category at step t
-            found_idx = active_indices_in_group[0] # Assume only one is active due to one-hot
-            # Check if it's NOT an unknown/NIU one
-            if found_idx not in unknown_indices:
-                last_valid_idx = found_idx
-                break # Stop lookback once a valid category is found
-    return last_valid_idx
 
-
-def update_sequences_and_features(current_sequences_tensor: torch.Tensor, # Shape: (N, S, F), on DEVICE
-                                  sampled_states: torch.Tensor, # Shape: (N,), on DEVICE
-                                  original_identifiers_df: pd.DataFrame, # CPU DataFrame, index matches tensor N dim
-                                  feature_names: list,
-                                  metadata: dict,
-                                  current_period: int, # Period *before* prediction (e.g., 202312)
-                                  state_rates: dict, # Group rates for this step {state_id: {unemp_rate: x, emp_rate: y}}
-                                  industry_rates: dict, # Group rates for this step {ind_id: {unemp_rate: x, emp_rate: y}}
-                                  overall_sample_unemp_rate: float, # Overall rate for this step
-                                  overall_sample_emp_rate: float, # Overall rate for this step
-                                  feature_indices: dict # Pre-calculated indices
-                                  ):
+# --- Refactored Feature Update Function (Tensor-based) ---
+@torch.no_grad() # Ensure no gradients are computed here
+def update_sequences_and_features_tensor(
+    current_sequences_tensor: torch.Tensor, # Shape: (N, S, F), on DEVICE
+    sampled_states_gpu: torch.Tensor, # Shape: (N,), on DEVICE
+    state_ids_int_gpu: torch.Tensor, # Shape: (N,), integer state IDs on GPU
+    ind_ids_int_gpu: torch.Tensor, # Shape: (N,), integer industry IDs on GPU
+    state_rates_tensor: torch.Tensor, # Shape: (num_states, 2), rates on GPU
+    industry_rates_tensor: torch.Tensor, # Shape: (num_industries, 2), rates on GPU
+    overall_sample_unemp_rate: float, # Overall rate for this step (scalar)
+    overall_sample_emp_rate: float, # Overall rate for this step (scalar)
+    feature_names: list, # Original feature names list
+    metadata: dict,
+    current_period: int, # Period *before* prediction (e.g., 202312)
+    feature_indices: dict # Pre-calculated indices
+    ):
     """
-    Updates sequences for the next step using vectorized operations where possible.
+    Updates sequences for the next step using tensor operations on the GPU.
     Shifts sequence, appends new features based on sampled state.
-    Handles time updates, aggregate rate updates (using group/overall rates), and ind/occ/class updates on E transition.
-    Operates primarily on NumPy arrays derived from tensors for easier manipulation, then converts back.
+    Handles time updates, aggregate rate updates (using group/overall rates).
+    Industry/Occupation/Class features are carried over implicitly.
     """
     device = current_sequences_tensor.device
     n_individuals, seq_len, n_features = current_sequences_tensor.shape
-    pad_val = metadata.get('pad_value', config.PAD_VALUE)
     target_map_inverse = metadata['target_state_map_inverse']
 
     # --- Find integer indices for states ---
     try:
         employed_int = next(k for k, v in target_map_inverse.items() if v.lower() == 'employed')
         unemployed_int = next(k for k, v in target_map_inverse.items() if v.lower() == 'unemployed')
-        nilf_int = next(k for k, v in target_map_inverse.items() if v.lower().replace(' ', '_') == 'not_in_labor_force' or v.lower() == 'nilf')
+        # nilf_int = next(k for k, v in target_map_inverse.items() if v.lower().replace(' ', '_') == 'not_in_labor_force' or v.lower() == 'nilf') # Not needed for updates
     except StopIteration:
-        raise ValueError("Metadata missing required state definitions ('employed', 'unemployed', 'nilf'/'not in labor force')")
+        raise ValueError("Metadata missing required state definitions ('employed', 'unemployed')")
 
-    # Pre-extract indices from the helper dict
-    state_indices = feature_indices['state_indices'] # Dict: {feature_name: index}
-    state_indices_values = list(state_indices.values()) # List of indices for state features
+    # Pre-extract feature indices
+    state_indices_dict = feature_indices['state_indices'] # Dict: {feature_name: index}
+    state_indices_values = list(state_indices_dict.values()) # List of indices for state features
     age_idx, months_last_idx, durunemp_idx = feature_indices['age_idx'], feature_indices['months_last_idx'], feature_indices['durunemp_idx']
+    mth_dim1_idx, mth_dim2_idx = feature_indices['mth_dim1_idx'], feature_indices['mth_dim2_idx']
     nat_unemp_idx, nat_emp_idx = feature_indices['nat_unemp_idx'], feature_indices['nat_emp_idx']
     state_unemp_idx, state_emp_idx = feature_indices['state_unemp_idx'], feature_indices['state_emp_idx']
     ind_unemp_idx, ind_emp_idx = feature_indices['ind_unemp_idx'], feature_indices['ind_emp_idx']
-    ind_group_indices, occ_group_indices, classwkr_indices = feature_indices['ind_group_indices'], feature_indices['occ_group_indices'], feature_indices['classwkr_indices']
-    ind_unknown_indices, occ_unknown_indices, classwkr_unknown_indices = feature_indices['ind_unknown_indices'], feature_indices['occ_unknown_indices'], feature_indices['classwkr_unknown_indices']
 
     # --- Determine next period ---
     current_year = current_period // 100
     current_month = current_period % 100
-    next_month_is_jan = (current_month == 12)
+    if current_month == 12:
+        next_month = 1
+    else:
+        next_month = current_month + 1
+    next_month_is_jan = (next_month == 1)
 
-    # --- Get data onto CPU for processing ---
-    sequence_history_np = current_sequences_tensor.cpu().numpy() # (N, S, F)
-    previous_features_np = sequence_history_np[:, -1, :] # Features from t-1 (N, F)
-    sampled_states_np = sampled_states.cpu().numpy() # Predicted states for next step (N,)
+    # --- Get previous features ON GPU ---
+    previous_features_gpu = current_sequences_tensor[:, -1, :] # Shape (N, F)
 
-    # Create array for the NEW feature vectors (N, F) - initialized from previous step
-    new_feature_vectors = np.copy(previous_features_np)
+    # Create tensor for the NEW feature vectors ON GPU - initialized from previous step
+    new_feature_vectors_gpu = previous_features_gpu.clone() # Use clone()
 
-    # --- Vectorized Feature Updates ---
+    # --- Vectorized Feature Updates ON GPU ---
 
-    # 1. Update 'current_state' based on sampled_state_np
-    new_feature_vectors[:, state_indices_values] = 0.0 # Reset all state flags
-    # Create mapping from sampled state int to the correct feature index
+    # 1. Update 'current_state' based on sampled_states_gpu
+    new_feature_vectors_gpu[:, state_indices_values] = 0.0 # Reset all state flags
+    # Create mapping from sampled state int to the correct feature index ONCE
+    # This map can be created outside if target_map_inverse doesn't change
     state_int_to_feature_idx = {}
     for state_int, state_name in target_map_inverse.items():
         feature_name = f'cat__current_state_{state_name}'
-        if feature_name in state_indices:
-            state_int_to_feature_idx[state_int] = state_indices[feature_name]
+        if feature_name in state_indices_dict:
+            state_int_to_feature_idx[state_int] = state_indices_dict[feature_name]
+        # else: # Warning printed during index finding if missing
+
+    # Map sampled states (GPU tensor) to their corresponding feature indices (CPU calculation, result is numpy array)
+    # Convert sampled_states_gpu to CPU only for this mapping step if necessary, or find a tensor way
+    # Let's try keeping it on GPU: Create a mapping tensor
+    max_state_int = max(target_map_inverse.keys())
+    state_map_tensor = torch.full((max_state_int + 1,), -1, dtype=torch.long, device=device)
+    valid_state_ints = []
+    valid_feature_indices = []
+    for state_int, feature_idx in state_int_to_feature_idx.items():
+        if state_int >= 0 and state_int <= max_state_int:
+             valid_state_ints.append(state_int)
+             valid_feature_indices.append(feature_idx)
+    state_map_tensor[torch.tensor(valid_state_ints, device=device)] = torch.tensor(valid_feature_indices, device=device)
+
+    # Gather the target feature indices using the mapping tensor
+    target_feature_indices_gpu = state_map_tensor[sampled_states_gpu]
+    valid_indices_mask_gpu = (target_feature_indices_gpu != -1)
+
+    # Use scatter_ or advanced indexing on GPU to set the correct state flag to 1.0
+    if torch.any(valid_indices_mask_gpu):
+        rows_to_update = torch.arange(n_individuals, device=device)[valid_indices_mask_gpu]
+        cols_to_update = target_feature_indices_gpu[valid_indices_mask_gpu]
+        # Ensure indices are within bounds (should be if mapping is correct)
+        if torch.all(cols_to_update >= 0) and torch.all(cols_to_update < n_features):
+             new_feature_vectors_gpu[rows_to_update, cols_to_update] = 1.0
         else:
-            print(f"Warning: State feature '{feature_name}' for state {state_int} not found in state_indices.")
-
-    # Map sampled states to their corresponding feature indices
-    # Handle potential missing mappings gracefully (though ideally all states should map)
-    target_feature_indices = np.array([state_int_to_feature_idx.get(s, -1) for s in sampled_states_np])
-    valid_indices_mask = (target_feature_indices != -1)
-    # Use advanced indexing to set the correct state flag to 1.0
-    if np.any(valid_indices_mask):
-        rows_to_update = np.arange(n_individuals)[valid_indices_mask]
-        cols_to_update = target_feature_indices[valid_indices_mask]
-        new_feature_vectors[rows_to_update, cols_to_update] = 1.0
-    if not np.all(valid_indices_mask):
-        print(f"Warning: Could not map {np.sum(~valid_indices_mask)} sampled states to feature indices.")
+             print("Warning: Invalid column indices detected during state update on GPU.")
+    # if not torch.all(valid_indices_mask_gpu): # Check if any were invalid
+    #     print(f"Warning: Could not map {torch.sum(~valid_indices_mask_gpu)} sampled states to feature indices on GPU.")
 
 
-    # 2. Update Time Features (Age, Months Since Last, Duration Unemployed)
+    # 2. Update Time Features ON GPU
     if age_idx != -1 and next_month_is_jan:
-        new_feature_vectors[:, age_idx] += 1
+        new_feature_vectors_gpu[:, age_idx] += 1
     if months_last_idx != -1:
-        new_feature_vectors[:, months_last_idx] += 1
+        new_feature_vectors_gpu[:, months_last_idx] += 1
     if durunemp_idx != -1:
-        is_unemployed_now_mask = (sampled_states_np == unemployed_int)
+        is_unemployed_now_mask_gpu = (sampled_states_gpu == unemployed_int)
         # Increment duration if unemployed now, otherwise reset to 0
-        new_feature_vectors[:, durunemp_idx] = np.where(is_unemployed_now_mask, previous_features_np[:, durunemp_idx] + 1, 0)
+        new_feature_vectors_gpu[:, durunemp_idx] = torch.where(
+            is_unemployed_now_mask_gpu,
+            previous_features_gpu[:, durunemp_idx] + 1,
+            torch.tensor(0.0, device=device) # Ensure reset value is tensor
+        )
+    # Update cyclical month features based on the *next* month, explicitly using float32
+    if mth_dim1_idx != -1:
+        new_feature_vectors_gpu[:, mth_dim1_idx] = torch.sin(torch.tensor(next_month / 12 * 2 * np.pi, dtype=torch.float32, device=device)) + 1
+    if mth_dim2_idx != -1:
+        new_feature_vectors_gpu[:, mth_dim2_idx] = torch.cos(torch.tensor(next_month / 12 * 2 * np.pi, dtype=torch.float32, device=device)) + 1
 
-    # 3. Update Aggregate Rate Features (National, State, Industry)
-    # Get original identifiers needed for mapping
-    original_id_cols = metadata.get('original_identifier_columns', [])
-    state_col = 'statefip' if 'statefip' in original_id_cols else None
-    ind_col = 'ind_group_cat' if 'ind_group_cat' in original_id_cols else None
 
-    # Map group rates - use pandas merge/map for efficiency
-    # Create a temporary df with individual IDs and their group identifiers
-    temp_rate_df = pd.DataFrame({
-        'id_idx': np.arange(n_individuals), # Index corresponding to numpy arrays
-        'state_id': original_identifiers_df[state_col].values if state_col else None,
-        'ind_id': original_identifiers_df[ind_col].values if ind_col else None
-    })
-
-    # Map state rates
-    if state_col and state_unemp_idx != -1 and state_emp_idx != -1 and state_rates:
-        state_rates_df = pd.DataFrame.from_dict(state_rates, orient='index').rename_axis('state_id').reset_index()
-        temp_rate_df = pd.merge(temp_rate_df, state_rates_df, on='state_id', how='left')
-        # Fill missing rates with previous values
-        new_state_unemp = temp_rate_df['unemp_rate'].values
-        new_state_emp = temp_rate_df['emp_rate'].values
-        nan_mask_state_unemp = np.isnan(new_state_unemp)
-        nan_mask_state_emp = np.isnan(new_state_emp)
-        new_feature_vectors[:, state_unemp_idx] = np.where(nan_mask_state_unemp, previous_features_np[:, state_unemp_idx], new_state_unemp)
-        new_feature_vectors[:, state_emp_idx] = np.where(nan_mask_state_emp, previous_features_np[:, state_emp_idx], new_state_emp)
-        temp_rate_df.drop(columns=['unemp_rate', 'emp_rate'], inplace=True, errors='ignore') # Clean up columns
-
-    # Map industry rates
-    if ind_col and ind_unemp_idx != -1 and ind_emp_idx != -1 and industry_rates:
-        ind_rates_df = pd.DataFrame.from_dict(industry_rates, orient='index').rename_axis('ind_id').reset_index()
-        temp_rate_df = pd.merge(temp_rate_df, ind_rates_df, on='ind_id', how='left')
-        # Fill missing rates with previous values
-        new_ind_unemp = temp_rate_df['unemp_rate'].values
-        new_ind_emp = temp_rate_df['emp_rate'].values
-        nan_mask_ind_unemp = np.isnan(new_ind_unemp)
-        nan_mask_ind_emp = np.isnan(new_ind_emp)
-        new_feature_vectors[:, ind_unemp_idx] = np.where(nan_mask_ind_unemp, previous_features_np[:, ind_unemp_idx], new_ind_unemp)
-        new_feature_vectors[:, ind_emp_idx] = np.where(nan_mask_ind_emp, previous_features_np[:, ind_emp_idx], new_ind_emp)
-        # temp_rate_df.drop(columns=['unemp_rate', 'emp_rate'], inplace=True) # Columns already dropped if state rates were processed
-
+    # 3. Update Aggregate Rate Features ON GPU
     # Update national rates (same for everyone)
-    if nat_unemp_idx != -1: new_feature_vectors[:, nat_unemp_idx] = overall_sample_unemp_rate
-    if nat_emp_idx != -1: new_feature_vectors[:, nat_emp_idx] = overall_sample_emp_rate
+    if nat_unemp_idx != -1: new_feature_vectors_gpu[:, nat_unemp_idx] = overall_sample_unemp_rate
+    if nat_emp_idx != -1: new_feature_vectors_gpu[:, nat_emp_idx] = overall_sample_emp_rate
 
-    # --- Non-Vectorized Part: Update Industry/Occupation/Class Worker Features on Transition ---
-    # This part remains a loop due to the complexity of the lookback logic
+    # Update state rates using gathered values
+    if state_unemp_idx != -1 and state_emp_idx != -1 and state_ids_int_gpu is not None:
+        # Gather rates for each individual based on their state ID index
+        # state_rates_tensor shape: (num_states, 2) -> [unemp_rate, emp_rate]
+        gathered_state_rates = state_rates_tensor[state_ids_int_gpu] # Shape: (N, 2)
+        # Handle potential NaNs/Infs from rate calculation (replace with previous value)
+        nan_mask_state_unemp = torch.isnan(gathered_state_rates[:, 0])
+        nan_mask_state_emp = torch.isnan(gathered_state_rates[:, 1])
+        new_feature_vectors_gpu[:, state_unemp_idx] = torch.where(nan_mask_state_unemp, previous_features_gpu[:, state_unemp_idx], gathered_state_rates[:, 0])
+        new_feature_vectors_gpu[:, state_emp_idx] = torch.where(nan_mask_state_emp, previous_features_gpu[:, state_emp_idx], gathered_state_rates[:, 1])
 
-    # Determine previous state from the one-hot encoding in previous_features
-    # Find the index of the maximum value (should be 1.0) within the state feature columns
-    previous_state_feature_indices = np.argmax(previous_features_np[:, state_indices_values], axis=1)
-    # Map these feature indices back to the integer state representation
-    feature_idx_to_state_int = {v: k for k, v in state_int_to_feature_idx.items()}
-    previous_states_int = np.array([feature_idx_to_state_int.get(state_indices_values[idx], -1)
-                                    for idx in previous_state_feature_indices])
+    # Update industry rates using gathered values
+    if ind_unemp_idx != -1 and ind_emp_idx != -1 and ind_ids_int_gpu is not None:
+        # Gather rates for each individual based on their industry ID index
+        # industry_rates_tensor shape: (num_industries, 2) -> [unemp_rate, emp_rate]
+        gathered_ind_rates = industry_rates_tensor[ind_ids_int_gpu] # Shape: (N, 2)
+        # Handle potential NaNs/Infs
+        nan_mask_ind_unemp = torch.isnan(gathered_ind_rates[:, 0])
+        nan_mask_ind_emp = torch.isnan(gathered_ind_rates[:, 1])
+        new_feature_vectors_gpu[:, ind_unemp_idx] = torch.where(nan_mask_ind_unemp, previous_features_gpu[:, ind_unemp_idx], gathered_ind_rates[:, 0])
+        new_feature_vectors_gpu[:, ind_emp_idx] = torch.where(nan_mask_ind_emp, previous_features_gpu[:, ind_emp_idx], gathered_ind_rates[:, 1])
 
-    # Identify individuals transitioning to employment
-    transition_to_emp_mask = np.isin(previous_states_int, [unemployed_int, nilf_int]) & (sampled_states_np == employed_int)
-    transition_indices = np.where(transition_to_emp_mask)[0]
+    # --- Industry/Occupation/Class features are carried over implicitly ---
 
-    if len(transition_indices) > 0:
-        for i in tqdm(transition_indices, desc="Updating Transition Features", leave=False, disable=len(transition_indices)<1000): # Add tqdm for long loops
-            # Use the full sequence history for this individual *before* the update
-            ind_sequence_history = sequence_history_np[i] # Shape (seq_len, n_features)
-
-            # Perform lookback for each group using the helper
-            last_ind_idx = _find_last_valid_category_index(ind_sequence_history, ind_group_indices, ind_unknown_indices)
-            last_occ_idx = _find_last_valid_category_index(ind_sequence_history, occ_group_indices, occ_unknown_indices)
-            last_cls_idx = _find_last_valid_category_index(ind_sequence_history, classwkr_indices, classwkr_unknown_indices)
-
-            # Update new feature vector if a valid historical category was found
-            if last_ind_idx != -1:
-                new_feature_vectors[i, list(ind_group_indices.values())] = 0.0 # Reset group flags
-                new_feature_vectors[i, last_ind_idx] = 1.0 # Set historical flag
-            if last_occ_idx != -1:
-                new_feature_vectors[i, list(occ_group_indices.values())] = 0.0
-                new_feature_vectors[i, last_occ_idx] = 1.0
-            if last_cls_idx != -1:
-                new_feature_vectors[i, list(classwkr_indices.values())] = 0.0
-                new_feature_vectors[i, last_cls_idx] = 1.0
-            # Else: Keep the features inherited from the previous step (likely 'Unknown'/'NIU')
-
-    # --- Shift sequences and append ---
+    # --- Shift sequences and append ON GPU ---
     # Shift left (remove oldest time step)
-    shifted_sequences_np = sequence_history_np[:, 1:, :]
+    shifted_sequences_gpu = current_sequences_tensor[:, 1:, :]
     # Append the newly calculated feature vectors as the last time step
     # Add a time dimension: (N, F) -> (N, 1, F)
-    new_sequences_np = np.concatenate([shifted_sequences_np, new_feature_vectors[:, np.newaxis, :]], axis=1)
+    new_sequences_gpu = torch.cat([shifted_sequences_gpu, new_feature_vectors_gpu.unsqueeze(1)], dim=1)
 
-    # Convert back to tensor and return on the original device
-    return torch.from_numpy(new_sequences_np.astype(np.float32)).to(device) # Ensure float32
+    return new_sequences_gpu # Return tensor on GPU
 
 
 def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # Shape: (N, S, F), on DEVICE
@@ -658,30 +604,32 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
                                       initial_period: int, # Starting period YYYYMM
                                       periods_to_forecast: int = 12,
                                       n_samples: int = 1, # Default to 1 for HPT objective, >1 for full forecast
-                                      return_raw_samples: bool = False # Control returning raw sample data
+                                      return_raw_samples: bool = False, # Control returning raw sample data
+                                      forecast_batch_size: int = 512 # Added batch size for forecasting step
                                       ):
     """
-    Runs the multi-period forecast simulation, processing one sample fully at a time
-    to conserve memory. Calculates and uses group-specific rates dynamically.
-    Returns aggregated forecast statistics (median, CI) and optionally raw sample trajectories.
+    Runs the multi-period forecast simulation using tensor operations for efficiency.
+    Processes one sample fully at a time to conserve memory.
+    Processes individuals in mini-batches during prediction.
+    Calculates and uses group-specific rates dynamically on GPU.
+    Returns aggregated forecast statistics (mean, CI) and optionally raw sample trajectories.
     """
-    print(f"\nStarting multi-period forecast:")
+    print(f"\nStarting multi-period forecast (Tensor Optimized):") # Updated print
     print(f" - Initial Period: {initial_period}")
     print(f" - Periods to Forecast: {periods_to_forecast}")
     print(f" - Number of Samples: {n_samples}")
     print(f" - Device: {device}")
-    print(" - Strategy: Sequential processing of samples, dynamic group-rate calculation.")
+    print(f" - Forecast Batch Size: {forecast_batch_size}")
+    print(" - Strategy: Sequential samples, batched prediction, tensorized rate calculation & feature updates.")
 
     # Store results per sample, per period (for unemployment rate primarily)
     all_samples_period_urs = [] # List of lists: outer=samples, inner=UR per period
 
     n_individuals, seq_len, n_features = initial_sequences_tensor.shape
-    # Keep identifiers constant across samples and time (assuming they don't change)
-    current_identifiers_df = initial_identifiers_df.copy() # Use a copy
     # Move initial weights to GPU tensor for calculations
     current_weights_gpu = torch.from_numpy(initial_weights_series.values.astype(np.float32)).to(device)
 
-    # --- Get metadata/params needed within the loop ---
+    # --- Get metadata/params needed ---
     feature_names = metadata.get('feature_names', [])
     target_map_inverse = metadata.get('target_state_map_inverse', {})
     original_id_cols = metadata.get('original_identifier_columns', [])
@@ -695,20 +643,27 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
     print("Pre-calculating feature indices...")
     try:
         feature_indices = _find_feature_indices(feature_names, target_map_inverse)
+        # ... existing checks ...
         print("Feature indices calculated successfully.")
     except ValueError as e:
         print(f"Fatal error during feature index calculation: {e}")
         raise
-    # --- End Pre-calculation ---
 
+    # --- Pre-map Group IDs to Integers ONCE ---
+    print("Mapping group identifiers to integer indices...")
+    state_ids_int_gpu, num_states, _ = map_group_ids_to_int(initial_identifiers_df[state_col]) if state_col else (None, 0, {})
+    ind_ids_int_gpu, num_industries, _ = map_group_ids_to_int(initial_identifiers_df[ind_col]) if ind_col else (None, 0, {})
+    # Move mapped IDs to GPU
+    if state_ids_int_gpu is not None: state_ids_int_gpu = state_ids_int_gpu.to(device)
+    if ind_ids_int_gpu is not None: ind_ids_int_gpu = ind_ids_int_gpu.to(device)
+    print("Group ID mapping complete.")
 
     # --- Outer loop: Iterate through each Monte Carlo sample ---
     for s in tqdm(range(n_samples), desc="Processing Samples", disable=(n_samples <= 1)):
         sample_period_urs = [] # Store overall UR for each period within this sample
 
         # Initialize sequence tensor for this sample by cloning the initial state
-        # Ensure it's on the correct device
-        current_sample_sequences_gpu = initial_sequences_tensor.clone().to(device)
+        current_sample_sequences_gpu = initial_sequences_tensor.clone() # Already on device
         current_sim_period = initial_period # Reset start period for each sample
 
         # --- Inner loop: Iterate through forecast periods for this sample ---
@@ -725,47 +680,61 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
             target_period = target_year * 100 + target_month
 
             # --- Simulation Step ---
-            # 1. Predict probability distribution for the next state
-            probabilities_gpu = forecast_next_period_pytorch(
-                current_sample_sequences_gpu, model, device, metadata
-            )
+            # 1. Predict probability distribution for the next state IN BATCHES
+            all_probabilities_gpu = [] # Initialize list to store batch probabilities
+            num_individuals = current_sample_sequences_gpu.shape[0]
+            # Inner loop for mini-batch prediction
+            for batch_start in range(0, num_individuals, forecast_batch_size):
+                batch_end = min(batch_start + forecast_batch_size, num_individuals)
+                sequences_batch_gpu = current_sample_sequences_gpu[batch_start:batch_end]
+
+                # Predict for the current mini-batch
+                probabilities_batch_gpu = forecast_next_period_pytorch(
+                    sequences_batch_gpu, model, device, metadata
+                )
+                all_probabilities_gpu.append(probabilities_batch_gpu)
+                # Optional: Clear cache within batch loop if memory is extremely tight
+                # if device.type == 'cuda': torch.cuda.empty_cache()
+                # elif device.type == 'mps': torch.mps.empty_cache()
+
+            # Concatenate probabilities from all batches
+            probabilities_gpu = torch.cat(all_probabilities_gpu, dim=0)
+            del all_probabilities_gpu # Free memory from list of tensors
 
             # 2. Sample states and calculate WEIGHTED OVERALL rates for this sample step
             sampled_states_gpu, weighted_overall_unemp_rate, weighted_overall_emp_rate = sample_states_and_calc_rates(
                  probabilities_gpu, current_weights_gpu, metadata
             )
-            # Store the weighted overall UR for this period and sample
             sample_period_urs.append(weighted_overall_unemp_rate)
 
-            # 3. Calculate WEIGHTED Group-Specific Rates (State, Industry) for this sample step
-            sampled_states_np = sampled_states_gpu.cpu().numpy() # Needs CPU numpy array
-            state_rates_dict = {}
-            industry_rates_dict = {}
-            # Only calculate if the corresponding identifier column exists
-            if state_col and state_col in current_identifiers_df.columns:
-                state_rates_dict = calculate_group_rates(
-                    sampled_states_np, current_identifiers_df[state_col], initial_weights_series, target_map_inverse
-                )
-            if ind_col and ind_col in current_identifiers_df.columns:
-                 industry_rates_dict = calculate_group_rates(
-                    sampled_states_np, current_identifiers_df[ind_col], initial_weights_series, target_map_inverse
+            # 3. Calculate WEIGHTED Group-Specific Rates (State, Industry) using TENSOR function
+            state_rates_tensor = torch.zeros((num_states, 2), device=device) # Default to zeros
+            if state_ids_int_gpu is not None and num_states > 0:
+                state_rates_tensor = calculate_group_rates_tensor(
+                    sampled_states_gpu, current_weights_gpu, state_ids_int_gpu, num_states, metadata
                 )
 
-            # 4. Update this sample's sequences using its sampled states and calculated rates
-            current_sample_sequences_gpu = update_sequences_and_features(
-                current_sample_sequences_gpu,   # Pass current GPU tensor
-                sampled_states_gpu,             # Pass predicted states on GPU
-                current_identifiers_df,         # Pass identifiers DataFrame (CPU)
-                feature_names,
-                metadata,
-                current_sim_period,             # The period *before* the prediction
-                state_rates_dict,               # Pass calculated state rates (CPU dict)
-                industry_rates_dict,            # Pass calculated industry rates (CPU dict)
-                weighted_overall_unemp_rate,    # Pass weighted overall rate for national features
-                weighted_overall_emp_rate,      # Pass weighted overall rate for national features
-                feature_indices                 # Pass pre-calculated indices
+            industry_rates_tensor = torch.zeros((num_industries, 2), device=device) # Default to zeros
+            if ind_ids_int_gpu is not None and num_industries > 0:
+                 industry_rates_tensor = calculate_group_rates_tensor(
+                    sampled_states_gpu, current_weights_gpu, ind_ids_int_gpu, num_industries, metadata
+                )
+
+            # 4. Update this sample's sequences using TENSORIZED function
+            current_sample_sequences_gpu = update_sequences_and_features_tensor(
+                current_sequences_tensor=current_sample_sequences_gpu,
+                sampled_states_gpu=sampled_states_gpu,
+                state_ids_int_gpu=state_ids_int_gpu,
+                ind_ids_int_gpu=ind_ids_int_gpu,
+                state_rates_tensor=state_rates_tensor,
+                industry_rates_tensor=industry_rates_tensor,
+                overall_sample_unemp_rate=weighted_overall_unemp_rate,
+                overall_sample_emp_rate=weighted_overall_emp_rate,
+                feature_names=feature_names,
+                metadata=metadata,
+                current_period=current_sim_period,
+                feature_indices=feature_indices
             )
-            # updated tensor remains on GPU for the next iteration
 
             # 5. Advance time for the next period in this sample's simulation
             current_sim_period = target_period
@@ -807,16 +776,16 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
     # Rows = samples, Columns = forecast periods
     if not all_samples_period_urs:
         print("Warning: No sample results were collected. Cannot aggregate.")
-        empty_agg_df = pd.DataFrame(columns=['period', 'date', 'unemployment_rate_median', 'unemployment_rate_p10', 'unemployment_rate_p90'])
+        empty_agg_df = pd.DataFrame(columns=['period', 'date', 'unemployment_rate_forecast', 'unemployment_rate_p10', 'unemployment_rate_p90'])
         empty_raw_df = pd.DataFrame()
         return empty_agg_df, empty_raw_df # Return empty dataframes
 
     sample_urs_over_time = pd.DataFrame(all_samples_period_urs, columns=forecast_periods_list)
 
-    # Calculate quantiles across samples (axis=0) for each period (column)
+    # Calculate mean and quantiles across samples (axis=0) for each period (column)
     forecast_agg_df = pd.DataFrame({
         'period': forecast_periods_list,
-        'unemployment_rate_median': sample_urs_over_time.median(axis=0).values,
+        'unemployment_rate_forecast': sample_urs_over_time.mean(axis=0).values, # Use MEAN as primary forecast
         'unemployment_rate_p10': sample_urs_over_time.quantile(0.1, axis=0).values,
         'unemployment_rate_p90': sample_urs_over_time.quantile(0.9, axis=0).values,
         # Add Employment Rate aggregation if needed (would require collecting all_samples_period_ers)
@@ -835,170 +804,6 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
         return forecast_agg_df, pd.DataFrame()
 
 
-# --- Plotting Function ---
-def plot_unemployment_forecast_py(national_rates_file: Path, # Changed input
-                                  forecast_agg_df: pd.DataFrame, # Aggregated (median, p10, p90)
-                                  sample_urs_over_time: pd.DataFrame, # Raw sample UR data (Samples x Periods)
-                                  output_path: Path,
-                                  metadata: dict):
-    """Plots historical and forecasted unemployment rates, showing individual sample trajectories, median, and 80% CI."""
-    print("Creating forecast visualization...")
-
-    # --- Load Historical National Rates ---
-    historical_df = pd.DataFrame() # Initialize empty
-    if national_rates_file.exists():
-        try:
-            historical_df = pd.read_csv(national_rates_file)
-            # Ensure correct column names and types
-            if 'date' not in historical_df.columns or 'national_unemp_rate' not in historical_df.columns:
-                 raise ValueError("National rates file missing required columns: 'date', 'national_unemp_rate'")
-            historical_df['date'] = pd.to_datetime(historical_df['date'])
-            # Rename column for consistency with plotting code below
-            historical_df.rename(columns={'national_unemp_rate': 'unemployment_rate'}, inplace=True)
-            historical_df = historical_df.dropna(subset=['date', 'unemployment_rate']).sort_values('date')
-            print(f"Loaded historical national rates from: {national_rates_file}")
-        except Exception as e:
-            print(f"Warning: Failed to load or process historical rates from {national_rates_file}: {e}. Plotting forecast only.")
-            historical_df = pd.DataFrame() # Reset on error
-    else:
-        print(f"Warning: Historical national rates file not found at {national_rates_file}. Plotting forecast only.")
-
-    if forecast_agg_df.empty:
-        print("Warning: Aggregated forecast data is empty. Cannot plot forecast.")
-        return
-    # Allow plotting even if raw samples are empty (e.g., if return_raw_samples=False)
-    plot_samples = not sample_urs_over_time.empty
-
-    # Ensure date columns are valid datetime objects
-    # historical_df date conversion done above
-    forecast_agg_df['date'] = pd.to_datetime(forecast_agg_df['date']) # Already done? Ensure it.
-    forecast_agg_df = forecast_agg_df.dropna(subset=['date', 'unemployment_rate_median', 'unemployment_rate_p10', 'unemployment_rate_p90']).sort_values('date')
-
-    # --- Determine Plot Range ---
-    forecast_start_date = forecast_agg_df['date'].min() if not forecast_agg_df.empty else pd.Timestamp.now()
-    # Show ~1 year of history before forecast starts
-    history_display_start_date = forecast_start_date - pd.DateOffset(years=1)
-
-    # Prepare data for plotting
-    historical_df_display = historical_df[historical_df['date'] >= history_display_start_date] if not historical_df.empty else pd.DataFrame()
-    forecast_dates = forecast_agg_df['date'].values
-    forecast_median = forecast_agg_df['unemployment_rate_median'].values
-    forecast_p10 = forecast_agg_df['unemployment_rate_p10'].values
-    forecast_p90 = forecast_agg_df['unemployment_rate_p90'].values
-
-    # --- Create Plot ---
-    plt.style.use('seaborn-v0_8-darkgrid')
-    fig, ax = plt.subplots(figsize=(14, 7))
-
-    # Plot historical data (limited view)
-    last_hist_date = None
-    last_hist_rate = None
-    if not historical_df_display.empty:
-        ax.plot(historical_df_display['date'], historical_df_display['unemployment_rate'],
-                label='Historical (Recent)', color='black', linewidth=1.5, zorder=5)
-        # Get the last historical point to connect the forecast
-        last_hist_point = historical_df_display.iloc[-1]
-        last_hist_date = last_hist_point['date']
-        last_hist_rate = last_hist_point['unemployment_rate']
-
-    # Prepend last historical point to forecast data for visual connection
-    plot_forecast_dates = forecast_dates
-    plot_forecast_median = forecast_median
-    plot_forecast_p10 = forecast_p10
-    plot_forecast_p90 = forecast_p90
-    plot_sample_urs_df = sample_urs_over_time # Use original if plotting samples
-
-    if last_hist_date is not None and last_hist_rate is not None and not forecast_agg_df.empty:
-        # Ensure the first forecast date is immediately after the last historical date
-        # (This assumes monthly data and correct alignment)
-        if forecast_dates[0] > last_hist_date:
-            plot_forecast_dates = np.insert(forecast_dates, 0, last_hist_date)
-            plot_forecast_median = np.insert(forecast_median, 0, last_hist_rate)
-            plot_forecast_p10 = np.insert(forecast_p10, 0, last_hist_rate) # Start CI from last known point
-            plot_forecast_p90 = np.insert(forecast_p90, 0, last_hist_rate) # Start CI from last known point
-
-            # Also adjust sample trajectories if they exist and are being plotted
-            if plot_samples:
-                # Create a temporary DataFrame for plotting samples
-                plot_sample_urs_df = sample_urs_over_time.copy()
-                # Add the last historical rate as the first column, using the last historical date as the column name
-                # Convert date to a suitable column name (e.g., string) if necessary
-                last_hist_date_col = last_hist_date # pd.Timestamp works as column name
-                plot_sample_urs_df.insert(0, last_hist_date_col, last_hist_rate)
-
-
-    # Plot individual sample trajectories (if available and requested) using potentially adjusted data
-    sample_plot_dates = None # Initialize
-    if plot_samples:
-        n_samples_to_plot = plot_sample_urs_df.shape[0]
-        # Use the adjusted dates and sample data
-        # Ensure the number of date points matches the number of columns in the sample data
-        if plot_forecast_dates.size == plot_sample_urs_df.shape[1]:
-            sample_plot_dates = plot_forecast_dates
-            for i in range(n_samples_to_plot):
-                ax.plot(sample_plot_dates, plot_sample_urs_df.iloc[i].values,
-                        color='steelblue', alpha=0.25, linewidth=0.6, zorder=1) # Darker color, slightly higher alpha/linewidth
-            # Add a label for the samples collection only once (won't appear in legend by default)
-            ax.plot([], [], color='steelblue', alpha=0.5, linewidth=1, label='Sample Trajectories') # Dummy plot for legend
-        else:
-            print(f"Warning: Mismatch between number of forecast dates ({plot_forecast_dates.size}) and sample data columns ({plot_sample_urs_df.shape[1]}) after adjustment. Skipping sample trajectory plotting.")
-
-
-    # Plot confidence interval (P10-P90) - light shading using potentially adjusted data
-    ax.fill_between(plot_forecast_dates,
-                    plot_forecast_p10,
-                    plot_forecast_p90,
-                    color='skyblue', alpha=0.4, label='Forecast (80% CI)', zorder=2)
-
-    # Plot forecast median (darker line) using potentially adjusted data
-    ax.plot(plot_forecast_dates, plot_forecast_median,
-            label='Forecast (Median)', color='blue', linewidth=2.0, linestyle='--', zorder=3)
-
-    # Use state mapping for title/labels if needed
-    target_map_inverse = metadata.get('target_state_map_inverse', {1: 'Unemployed'})
-    unemployed_label = target_map_inverse.get(next((k for k, v in target_map_inverse.items() if v.lower() == 'unemployed'), 1), 'Unemployed')
-
-    # Formatting
-    ax.set_title('Unemployment Rate Forecast (Transformer Model)', fontsize=16, fontweight='bold') # Updated Title
-    ax.set_xlabel('Date', fontsize=12)
-    ax.set_ylabel('Unemployment Rate', fontsize=12) # Updated Label
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1%}')) # Format as percentage
-
-    # Improve date axis formatting
-    locator = mdates.AutoDateLocator(minticks=6, maxticks=12)
-    formatter = mdates.ConciseDateFormatter(locator, show_offset=False)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(formatter)
-
-    # Adjust legend
-    handles, labels = ax.get_legend_handles_labels()
-    # Filter labels slightly if needed, e.g., remove sample trajectories from explicit legend
-    # Example: keep only Historical, Median, CI
-    filtered_handles = [h for h, l in zip(handles, labels) if l in ['Historical (Recent)', 'Forecast (Median)', 'Forecast (80% CI)']]
-    filtered_labels = [l for l in labels if l in ['Historical (Recent)', 'Forecast (Median)', 'Forecast (80% CI)']]
-    # Check if sample trajectories were plotted using the adjusted data check
-    if plot_samples and sample_plot_dates is not None:
-         # Add the dummy 'Sample Trajectories' label if plotted
-         sample_handle = next((h for h, l in zip(handles, labels) if l == 'Sample Trajectories'), None)
-         if sample_handle:
-              filtered_handles.append(sample_handle)
-              filtered_labels.append('Sample Trajectories')
-
-    ax.legend(filtered_handles, filtered_labels, fontsize=11)
-
-    ax.grid(True, which='major', linestyle='--', linewidth=0.5)
-    ax.set_ylim(bottom=0) # Start y-axis at 0
-    fig.autofmt_xdate() # Rotate date labels if needed
-
-    plt.tight_layout()
-
-    try:
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        print(f"Plot saved successfully to {output_path}")
-    except Exception as e:
-        print(f"Error saving plot: {e}")
-    plt.close(fig) # Close the figure to free memory
-
 # --- HPT Objective Specific Functions ---
 
 def calculate_hpt_forecast_metrics(model: nn.Module,
@@ -1007,14 +812,16 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
                                 metadata: dict,
                                 params: dict,
                                 device,
-                                # num_forecasts: int = 3, # Number of forecasts determined by intervals
-                                forecast_horizon: int = 12): # Months to forecast
+                                forecast_horizon: int = 12, # Months to forecast
+                                forecast_batch_size: int = 512, # Added batch size for HPT forecast
+                                hpt_mc_samples: int = 1 # Number of samples for HPT forecast
+                                ):
     """
-    Calculates the HPT objective: RMSE and Standard Deviation of aggregate unemployment rate error
-    over multiple recursive forecasts, using the pre-calculated national rates file as truth.
-    Forecasts start at the beginning of each interval defined in metadata['hpt_validation_intervals'].
+    Calculates the HPT objective using the tensor-optimized forecast function.
+    Uses the MEAN forecast across hpt_mc_samples for comparison.
     """
     print("\n===== Calculating HPT Metric (Forecast RMSE & Std Dev vs National Rates File) =====")
+    print(f"Using {hpt_mc_samples} MC sample(s) per forecast run.")
     if hpt_val_baked_data is None or hpt_val_baked_data.empty:
         print("HPT validation baked data is empty. Cannot select start periods.")
         return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
@@ -1122,10 +929,10 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
             )
             initial_sequences_tensor = torch.from_numpy(initial_sequences_np).to(device)
 
-            # 3. Run the recursive forecast (using n_samples=1 for HPT objective)
-            forecast_agg_df, _ = forecast_multiple_periods_pytorch(
+            # 3. Run the recursive forecast (using tensor-optimized function)
+            forecast_agg_df, _ = forecast_multiple_periods_pytorch( # Call the main (now optimized) function
                 initial_sequences_tensor=initial_sequences_tensor,
-                initial_identifiers_df=initial_identifiers_df,
+                initial_identifiers_df=initial_identifiers_df, # Still needed for ID mapping inside
                 initial_weights_series=initial_weights_series,
                 model=model,
                 device=device,
@@ -1133,17 +940,18 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
                 params=params,
                 initial_period=start_period,
                 periods_to_forecast=forecast_horizon,
-                n_samples=1, # Only need one sample path (median effectively) for RMSE calculation
-                return_raw_samples=False
+                n_samples=hpt_mc_samples, # Use specified number of samples
+                return_raw_samples=False,
+                forecast_batch_size=forecast_batch_size # Pass batch size
             )
 
             if forecast_agg_df.empty:
                 print(f"Warning: Forecast from start period {start_period} returned empty results.")
                 continue
 
-            # 4. Merge with actual rates (loaded from file) and calculate errors
+            # 4. Merge with actual rates (loaded from file) and calculate errors using MEAN forecast
             comparison_df = pd.merge(
-                forecast_agg_df[['period', 'unemployment_rate_median']],
+                forecast_agg_df[['period', 'unemployment_rate_forecast']], # Use MEAN forecast column
                 actual_rates_df, # Use the dataframe loaded from national_rates_file
                 on='period',
                 how='inner' # Only compare months where both forecast and actual exist
@@ -1154,13 +962,13 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
 
             if not comparison_df.empty:
                 # --- Added Diagnostic Printing ---
-                print(f"  Comparison Data (Forecast vs Actual) for start_period {start_period}:")
+                print(f"  Comparison Data (Mean Forecast vs Actual) for start_period {start_period}:") # Update print label
                 print(comparison_df.to_string(index=False, float_format="%.6f"))
                 # --- End Added Diagnostic Printing ---
 
-                errors = comparison_df['unemployment_rate_median'] - comparison_df['actual_unemployment_rate']
+                errors = comparison_df['unemployment_rate_forecast'] - comparison_df['actual_unemployment_rate'] # Use MEAN forecast
                 all_forecast_errors.extend(errors.tolist())
-                run_rmse = np.sqrt(mean_squared_error(comparison_df['actual_unemployment_rate'], comparison_df['unemployment_rate_median']))
+                run_rmse = np.sqrt(mean_squared_error(comparison_df['actual_unemployment_rate'], comparison_df['unemployment_rate_forecast'])) # Use MEAN forecast
                 print(f"  -> Forecast run from {start_period} completed. RMSE for this run: {run_rmse:.6f}")
             else:
                  print(f"  -> Forecast run from {start_period} - No matching actual data found for comparison in national rates file.")
@@ -1189,6 +997,7 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
     print(f"  Std Dev: {final_std_dev:.6f}") # Print standard deviation
 
     return {'rmse': final_rmse, 'std_dev': final_std_dev} # Return std_dev
+
 
 # --- Standard Evaluation Function (from training script) ---
 def evaluate_aggregate_unemployment_error(model, dataloader, device, metadata):

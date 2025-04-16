@@ -44,7 +44,8 @@ def objective(trial: optuna.Trial, train_evaluate_func,
         'mlp_dropout': trial.suggest_float("mlp_dropout", config.HPT_MLP_DROPOUT_MIN, config.HPT_MLP_DROPOUT_MAX),
         'learning_rate': trial.suggest_float("learning_rate", config.HPT_LR_MIN, config.HPT_LR_MAX, log=True),
         'batch_size': trial.suggest_categorical("batch_size", config.HPT_BATCH_SIZE_OPTIONS),
-        'loss_weight_factor': trial.suggest_float("loss_weight_factor", config.HPT_LOSS_WEIGHT_FACTOR_MIN, config.HPT_LOSS_WEIGHT_FACTOR_MAX),
+        'focal_loss_gamma': trial.suggest_float("focal_loss_gamma", config.HPT_FOCAL_LOSS_GAMMA_MIN, config.HPT_FOCAL_LOSS_GAMMA_MAX), # Add gamma tuning
+        'transition_weight_factor': trial.suggest_float("transition_weight_factor", config.HPT_TRANSITION_WEIGHT_FACTOR_MIN, config.HPT_TRANSITION_WEIGHT_FACTOR_MAX), # Add transition factor tuning
         # Fixed Parameters (passed from config)
         'sequence_length': config.SEQUENCE_LENGTH,
         'epochs': config.HPT_EPOCHS,
@@ -61,7 +62,9 @@ def objective(trial: optuna.Trial, train_evaluate_func,
     # Store the tunable keys separately for logging
     tunable_keys = [
         'embed_dim', 'num_heads', 'ff_dim', 'num_transformer_blocks', 'mlp_units',
-        'dropout', 'mlp_dropout', 'learning_rate', 'batch_size', 'loss_weight_factor'
+        'dropout', 'mlp_dropout', 'learning_rate', 'batch_size',
+        'focal_loss_gamma', # Add gamma to tunable keys
+        'transition_weight_factor' # Add transition factor
     ]
 
     # --- Constraint Check: Embed dim vs Num heads ---
@@ -122,7 +125,8 @@ def objective(trial: optuna.Trial, train_evaluate_func,
                 metadata=metadata, # Pass full metadata
                 params=hparams, # Pass the hyperparameters used for this trial
                 device=device,
-                forecast_horizon=hparams['hpt_forecast_horizon']
+                forecast_horizon=hparams['hpt_forecast_horizon'],
+                hpt_mc_samples=config.HPT_MC_SAMPLES # Explicitly pass the value from config
             )
             forecast_rmse = forecast_metrics.get('rmse', float('inf'))
             forecast_std_dev = forecast_metrics.get('std_dev', float('inf')) # Changed from variance
@@ -239,7 +243,9 @@ def run_hyperparameter_tuning(args, base_output_dir, train_evaluate_func):
     print(f"Best hyperparameters file: {best_hparams_file}")
     print(f"HPT Objective: Minimize '{optimization_metric}' on HPT Validation Intervals")
     print(f"HPT Forecast Horizon: {config.HPT_FORECAST_HORIZON} months")
-    print(f"HPT Loss Weight Factor Range: [{config.HPT_LOSS_WEIGHT_FACTOR_MIN}, {config.HPT_LOSS_WEIGHT_FACTOR_MAX}]")
+    print(f"HPT Focal Loss Gamma Range: [{config.HPT_FOCAL_LOSS_GAMMA_MIN}, {config.HPT_FOCAL_LOSS_GAMMA_MAX}]")
+    print(f"HPT Transition Weight Factor Range: [{config.HPT_TRANSITION_WEIGHT_FACTOR_MIN}, {config.HPT_TRANSITION_WEIGHT_FACTOR_MAX}]")
+
 
     # --- Load Metadata and Paths needed for Objective Calculation ---
     # The objective function loads the actual HPT interval data itself.
