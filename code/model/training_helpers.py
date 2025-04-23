@@ -364,16 +364,8 @@ def run_training_loop(model, train_loader, val_loader, criterion, optimizer, sch
 
         # --- Optuna Pruning Check ---
         if trial:
-            # Report the unweighted validation loss for pruning
-            trial.report(val_loss if not np.isnan(val_loss) else float('inf'), epoch) # Report inf if NaN
-            if trial.should_prune():
-                print(f"Trial pruned at epoch {epoch+1} based on intermediate validation loss.")
-                # Save history before pruning
-                try:
-                    history_file = checkpoint_path.parent / "training_history_pruned.pkl"
-                    with open(history_file, 'wb') as f: pickle.dump(history, f)
-                except Exception as e: print(f"Warning: Could not save history before pruning: {e}")
-                raise optuna.TrialPruned() # Let Optuna handle the pruning
+            trial.report(val_loss if not np.isnan(val_loss) else float('inf'), epoch)
+            # pruning disabled: do not call trial.should_prune() or raise TrialPruned
 
         # --- Check Early Stopping Condition ---
         if epochs_no_improve >= early_stopping_patience:

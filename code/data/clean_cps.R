@@ -5,7 +5,7 @@
 library(ipumsr)
 library(janitor)
 library(lubridate)
-library(plm)
+library(plm) # Note: plm is loaded but not used in *this* specific script. Keep if used elsewhere.
 # library(tidyverse) # Removed - Load specific packages if needed, many are dependencies anyway
 library(dotenv)
 library(data.table)
@@ -62,8 +62,6 @@ get_cps_samples <- function(project_root, start_date = "2019-01", end_date = "20
     # Source the script which should define the scrape_cps_samples function
     source(scraper_path)
     # Call the scraping function (assuming it's named scrape_cps_samples)
-    # This function should handle the actual scraping and saving/overwriting the file
-    # and return the path to the file.
     samples_file_scraped <- scrape_cps_samples(output_dir = metadata_dir, force = force_scrape)
     # Verify the file was created/updated by the scraper
     if (!file.exists(samples_file_scraped)) {
@@ -90,8 +88,8 @@ get_cps_samples <- function(project_root, start_date = "2019-01", end_date = "20
     date = as.Date(paste0(sample_year, "-", sample_month, "-01"))
   )]
 
+  # Filter by date range
   samples_dt <- samples_dt[date >= start_date & date <= end_date]
-
 
   # Apply ASEC filter if requested
   if (!include_asec) {
@@ -100,6 +98,7 @@ get_cps_samples <- function(project_root, start_date = "2019-01", end_date = "20
 
   # Convert back to data frame if downstream code expects it, or keep as DT
   # Returning data.frame as per original function signature
+  # Note: Could return data.table if calling function adapted
   return(as.data.frame(samples_dt))
 }
 
@@ -165,15 +164,12 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
     message("Attempting to load existing extract files using DDI: ", ddi_files[[1]], "...")
     tryCatch({
       # Use read_ipums_micro with the DDI file path.
-      # It should automatically find the corresponding data file if named conventionally.
       cps_data <- read_ipums_micro(ddi_files[[1]], verbose = FALSE) # Pass only DDI path
 
-      # Basic validation: Check if the loaded data seems reasonable
+      # Basic validation
       if (is.null(cps_data) || nrow(cps_data) == 0) {
           stop("Loaded data from existing files is empty or null.")
       }
-      # Optional: Add a check for date range consistency if needed, comparing
-      # min/max dates in cps_data with start_date/end_date.
 
       if (debug) message("Raw data dimensions (from existing files): ", paste(dim(cps_data), collapse = " x "))
       message("Successfully loaded data from existing files.")
@@ -182,8 +178,6 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
       message("Error loading existing files: ", e$message)
       message("Will proceed to download a new extract.")
       cps_data <<- NULL # Ensure cps_data is NULL if loading failed
-      # Optionally delete potentially corrupt files
-      # file.remove(c(data_files, ddi_files))
       data_files <<- character(0) # Reset file lists
       ddi_files <<- character(0)
     })
@@ -199,18 +193,17 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
           message("No suitable existing files found. Proceeding to download new extract.")
       }
 
-    # Define variables for extract - includes CBSASZ
+    # Define variables for extract
     variables <- c("CPSIDP", "AGE", "SEX", "RACE", "HISPAN",
                   "LABFORCE", "EMPSTAT", "EDUC", "DURUNEMP",
                   "IND1990", "OCC1990", "STATEFIP", "MONTH", "YEAR",
-                  "MISH", "WTFINL", "RELATE", "METRO", "CBSASZ", # Includes CBSASZ
-                  "MARST", "CITIZEN", "NATIVITY", "VETSTAT", "FAMSIZE",
-                  "NCHILD", "DIFFMOB", "DIFFANY", "CLASSWKR", "PROFCERT")
+                  "MISH", "WTFINL", "RELATE", "METRO", "CBSASZ",
+                  "MARST", "CITIZEN", "FAMSIZE", "NCHILD", "DIFFANY", "CLASSWKR")
 
     message("Submitting new extract request...")
     extract <- define_extract_micro(
       collection = "cps",
-      description = "CPS extract for unemployment analysis",
+      description = "CPS extract for analysis",
       samples = samples,
       variables = variables,
       data_format = "csv", # Requesting CSV
@@ -219,12 +212,12 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
     )
 
     submitted_extract <- submit_extract(extract)
-    extract_number_str <- sprintf("%05d", submitted_extract$number) # Format number e.g., 00023
+    extract_number_str <- sprintf("%05d", submitted_extract$number)
     message("Extract number: ", extract_number_str)
 
     wait_for_extract(submitted_extract)
     message("Downloading extract ", extract_number_str, " to ", download_dir)
-    # Call download_extract, but don't rely solely on its return value
+    # Call download_extract, check directory afterwards
     download_result <- tryCatch(
         download_extract(submitted_extract, download_dir = download_dir),
         error = function(e) {
@@ -232,7 +225,6 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
             return(NULL) # Return NULL on error
         }
     )
-    # Even if download_result seems incomplete, check the directory
     message("Download attempt finished. Verifying files in directory...")
 
     # Search the download directory for files matching the extract number
@@ -250,7 +242,6 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
         message("  Data files: ", paste(data_file_path, collapse=", "))
         stop("Could not find exactly one DDI and one data file for extract ", extract_number_str, " in ", download_dir)
     }
-    # Use the first (and only) match found
     ddi_file_path <- ddi_file_path[[1]]
     data_file_path <- data_file_path[[1]]
 
@@ -267,82 +258,61 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
     if (debug) message("Raw data dimensions (from new extract): ", paste(dim(cps_data), collapse = " x "))
   }
 
-  # Initial cleaning and date column creation
-  message("Creating date column and basic cleaning...")
-  cps_data <- cps_data %>%
-    janitor::clean_names() %>% # Clean names early
-    # Ensure it's a data.frame before data.table conversion if needed, but read_ipums_micro often returns tibble/df
-    as.data.frame()
-
-  # Convert to data.table for efficiency
+  # Initial cleaning and convert to data.table
+  message("Cleaning names and converting to data.table...")
+  cps_data <- janitor::clean_names(cps_data)
   setDT(cps_data)
   if (debug) message("Converted raw data to data.table")
 
-  # Create date column using data.table
+  # Create date column
   cps_data[, date := ymd(paste0(year, "-", month, "-01"))]
 
-  # Early subsetting by date if requested - before any heavy processing
+  # Early subsetting by date if requested
   if (!is.null(subset_start_date) && !is.null(subset_end_date)) {
-    message("*** SUBSETTING DATA EARLY - Before processing ***")
+    message("*** SUBSETTING DATA EARLY - By Date ***")
     subset_start_date_parsed <- as.Date(paste0(subset_start_date, "-01"))
     subset_end_date_parsed <- as.Date(paste0(subset_end_date, "-01"))
 
     message("Filtering data to subset date range: ", subset_start_date, " to ", subset_end_date)
-    rows_before <- nrow(cps_data)
-
-    # Use data.table filtering
+    rows_before_date_subset <- nrow(cps_data)
     cps_data <- cps_data[date >= subset_start_date_parsed & date <= subset_end_date_parsed]
-
-    rows_after <- nrow(cps_data)
-    message("Rows removed by date filtering: ", rows_before - rows_after,
-            " (", round((rows_before - rows_after) / rows_before * 100, 1), "% reduction)")
-
-    if (nrow(cps_data) == 0) {
-      stop("No data remaining after filtering for subset dates")
-    }
-
-    if (debug) {
-      message("Data dimensions after date subsetting: ", paste(dim(cps_data), collapse = " x "))
-      message("Unique individuals after date subsetting: ", uniqueN(cps_data$cpsidp))
-    }
+    rows_after_date_subset <- nrow(cps_data)
+    reduction_pct <- if(rows_before_date_subset > 0) round((rows_before_date_subset - rows_after_date_subset) / rows_before_date_subset * 100, 1) else 0
+    message("Rows removed by date filtering: ", rows_before_date_subset - rows_after_date_subset,
+            " (", reduction_pct, "% reduction)")
+    if (nrow(cps_data) == 0) stop("No data remaining after filtering for subset dates")
+    if (debug) message("Data dimensions after date subsetting: ", paste(dim(cps_data), collapse = " x "))
   }
 
-  # Continue with remaining processing - more efficient now with smaller dataset
-  message("Processing employment status and filtering for longitudinal analysis using data.table...")
-  rows_before <- nrow(cps_data)
+  # Filter for relevant population first (Age, Potential Labor Force)
+  message("Applying initial population filters (Age >= 16, LABFORCE != 0)...")
+  rows_before_pop_filter <- nrow(cps_data)
+  cps_data <- cps_data[age >= 16 & labforce != 0]
+  rows_after_pop_filter <- nrow(cps_data)
+  reduction_pct_pop <- if(rows_before_pop_filter > 0) round((rows_before_pop_filter - rows_after_pop_filter) / rows_before_pop_filter * 100, 1) else 0
+  message("Rows removed by initial population filter: ", rows_before_pop_filter - rows_after_pop_filter,
+          " (", reduction_pct_pop, "% reduction)")
+  if (nrow(cps_data) == 0) stop("No data remaining after initial population filtering")
 
-  # Ensure sorting for lead calculation
+  # Calculate leads and filter for month-to-month matches
+  message("Calculating leads and filtering for month-to-month observations...")
+  rows_before_month_filter <- nrow(cps_data)
   setkey(cps_data, cpsidp, date)
-
-  # Calculate month difference using data.table's shift more robustly
-  # We need the *next* month's data for the same person
   cps_data[, lead_date := shift(date, type = "lead"), by = cpsidp]
-  # Calculate difference in months
-  cps_data[, month_diff := as.numeric(lead_date - date) / 30.44] # Approximate days per month
+  cps_data[, month_diff := as.numeric(lead_date - date) / 30.44]
+  cps_data_filtered <- cps_data[month_diff > 0.9 & month_diff < 1.1]
+  cps_data_filtered[, `:=`(lead_date = NULL, month_diff = NULL)] # Remove temporary columns
+  rows_after_month_filter <- nrow(cps_data_filtered)
+  reduction_pct_month <- if(rows_before_month_filter > 0) round((rows_before_month_filter - rows_after_month_filter) / rows_before_month_filter * 100, 1) else 0
+  message("Rows removed by requiring consecutive month observation: ", rows_before_month_filter - rows_after_month_filter,
+          " (", reduction_pct_month, "% reduction)")
 
-  # Apply filters using data.table syntax
-  # Filter for working age (>=16), those *potentially* in labor force (labforce != 0 removes NIU),
-  # and those observed in the *immediately following* month (month_diff approx 1).
-  # Allow a small tolerance for month_diff calculation (e.g., 0.9 to 1.1)
-  cps_data_filtered <- cps_data[age >= 16 & labforce != 0 & month_diff > 0.9 & month_diff < 1.1]
-
-  # Remove temporary columns
-  cps_data_filtered[, `:=`(lead_date = NULL, month_diff = NULL)]
-
-  rows_after <- nrow(cps_data_filtered)
-  message("Rows removed by age/labor force/follow-up filtering: ", rows_before - rows_after,
-          " (", round((rows_before - rows_after) / rows_before * 100, 1), "% reduction)")
-
-  # Remove unnecessary columns - ensure wtfinl is NOT removed
-  # Add any other IPUMS system variables not needed (check DDI if unsure)
-  cols_to_remove <- c("serial", "asecflag", "asecwth", "pernum", "cpsid", "ident", "hwtfinl", "asecwt", # Common system/weight vars
-                      "lfproxy", "d_year", "cpsidv", "asecwt", "earnwke", "hrswork", "paidhour") # Examples of other potentially unneeded vars
-  # Find which of these columns actually exist in the data to avoid errors
+  # Remove unnecessary IPUMS columns
+  cols_to_remove <- c("serial", "asecflag", "asecwth", "pernum", "cpsid", "ident", "hwtfinl", "asecwt",
+                      "lfproxy", "d_year", "cpsidv", "asecwt", "earnwke", "hrswork", "paidhour")
   existing_cols_to_remove <- intersect(names(cps_data_filtered), cols_to_remove)
-
   if (length(existing_cols_to_remove) > 0) {
     message("Removing unnecessary IPUMS system/intermediate columns: ", paste(existing_cols_to_remove, collapse=", "))
-    # Use data.table's way to remove columns by reference
     cps_data_filtered[, (existing_cols_to_remove) := NULL]
   }
 
@@ -350,8 +320,7 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
     message("Final processed data dimensions before deriving variables: ", paste(dim(cps_data_filtered), collapse = " x "))
     message("Unique individuals in final data: ", uniqueN(cps_data_filtered$cpsidp))
   }
-
-  # Return as data.table
+  gc()
   return(cps_data_filtered)
 }
 
@@ -362,13 +331,9 @@ get_cps_data <- function(project_root, refresh_extract = FALSE,
 #' @param national_rates_output_path Path to save the national rates CSV.
 #' @return Processed CPS data as data.table
 process_cps_data <- function(cps, national_rates_output_path = NULL) {
-  # Ensure input is a data.table
   if (!is.data.table(cps)) setDT(cps)
 
   message("Deriving core employment status variables...")
-  # Create core employment status variables first using fifelse
-  # EMPSTAT Codes: 10, 12 = Employed; 20, 21, 22 = Unemployed
-  # LABFORCE Codes: 1 = Not in Labor Force, 2 = In Labor Force (implies emp or unemp)
   cps[, `:=`(
     emp = fifelse(empstat %in% c(10L, 12L), 1L, 0L),
     unemp = fifelse(empstat %in% c(20L, 21L, 22L), 1L, 0L),
@@ -376,51 +341,40 @@ process_cps_data <- function(cps, national_rates_output_path = NULL) {
   )]
 
   message("Deriving other categorical and numerical variables...")
-  # Create other derived variables using data.table syntax and fcase
   cps[, `:=`(
-    # Cyclical encoding for month
     mth_dim1 = round(sin(month / 12 * 2 * pi), 4) + 1,
     mth_dim2 = round(cos(month / 12 * 2 * pi), 4) + 1,
-    # HISPAN: 0=No; 100-400=Yes (specific origin); >=900=NIU/Unknown
     hispan_cat = fcase(
       hispan == 0L, "Not hispanic",
       hispan > 0L & hispan < 900L, "Hispanic",
-      default = NA_character_ # Handle 900+ codes as NA
+      default = NA_character_
     ),
-    # EDUC: Grouping educational attainment
     educ_cat = fcase(
-      educ > 1L & educ <= 73L, "High school or less", # Up to HS diploma (code 73)
-      educ > 73L & educ <= 110L, "Some college, no bachelor's degree", # Includes associate degrees (codes 81, 91, 92) but not bachelor's (111)
+      educ > 1L & educ <= 73L, "High school or less",
+      educ > 73L & educ <= 110L, "Some college, no bachelor's degree",
       educ == 111L, "Bachelor's degree",
-      educ %in% c(123L, 124L, 125L), "Advanced degree", # Master's (123), Prof (124), PhD (125)
-      default = NA_character_ # Codes 0, 1, 112+ (except 123-125) become NA
+      educ %in% c(123L, 124L, 125L), "Advanced degree",
+      default = NA_character_
     ),
-    # DURUNEMP: Duration of unemployment. 999=NIU. Set to 0 if not unemployed.
-    # Ensure integer type consistency
     durunemp = fifelse(unemp == 0L, 0L, fifelse(durunemp == 999L, NA_integer_, as.integer(durunemp))),
-    # IND1990: Convert to numeric for grouping
-    ind1990 = as.numeric(ind1990), # Keep as numeric for range checks
-    # RELATE: Relationship to head. Simplify. 101=Head, 201=Spouse, 301=Child.
+    ind1990 = as.numeric(ind1990),
     relate_cat = fcase(
         relate == 101L, "Head/Householder",
         relate == 201L, "Spouse",
         relate == 301L, "Child",
-        # Group other relatives and non-relatives
-        relate > 301L & relate < 1200L, "Other Relative/Non-relative", # Broad grouping
-        default = "Unknown/NIU" # Handle 0 or other codes
+        relate > 301L & relate < 1200L, "Other Relative/Non-relative",
+        default = "Unknown/NIU"
     ),
-    # METRO: Metropolitan status. 0=NIU, 1=Not ID, 2=Central City, 3=Suburb, 4=Non-metro
     metro_cat = fcase(
         metro == 0L, "NIU",
         metro == 1L, "Not identifiable",
         metro == 2L, "Central city",
         metro == 3L, "Outside central city",
         metro == 4L, "Not in metro area",
-        default = "Unknown" # Should generally not happen if codes are 0-4
+        default = "Unknown"
     ),
-    # CBSASZ: CBSA size. 0=NIU, 1-7=Size categories.
     cbsasz_cat = fcase(
-        cbsasz == 0L, "NIU/Non-metro", # Often 0 means non-metro or not ID'd
+        cbsasz == 0L, "NIU/Non-metro",
         cbsasz == 1L, "<100k",
         cbsasz == 2L, "100k-250k",
         cbsasz == 3L, "250k-500k",
@@ -430,7 +384,6 @@ process_cps_data <- function(cps, national_rates_output_path = NULL) {
         cbsasz == 7L, "5M+",
         default = "Unknown"
     ),
-    # MARST: Marital status. 1-6 = Categories. 9=NIU/Unknown.
     marst_cat = fcase(
         marst == 1L, "Married, spouse present",
         marst == 2L, "Married, spouse absent",
@@ -438,172 +391,163 @@ process_cps_data <- function(cps, national_rates_output_path = NULL) {
         marst == 4L, "Divorced",
         marst == 5L, "Widowed",
         marst == 6L, "Never married/single",
-        default = NA_character_ # Handle 9 (NIU) as NA
+        default = NA_character_
     ),
-    # CITIZEN: Citizenship status. 1-5 = Categories. 9=NIU/Unknown.
     citizen_cat = fcase(
         citizen == 1L, "Born in US",
         citizen == 2L, "Born in PR/Territory",
         citizen == 3L, "Born abroad, US parents",
         citizen == 4L, "Naturalized citizen",
         citizen == 5L, "Not a citizen",
-        default = NA_character_ # Handle 9 (NIU) as NA
+        default = NA_character_
     ),
-    # NATIVITY: Nativity. 1=Native, 5=Foreign born. 9=NIU/Unknown.
-    nativity_cat = fcase(
-        nativity == 1L, "Native born",
-        nativity > 1L & nativity < 5L, "Native born, foreign parents",
-        nativity == 5L, "Foreign born",
-        default = NA_character_ # Handle 9 (NIU) as NA
-    ),
-    # VETSTAT: Veteran status. 0=NIU, 1=No service, 2=Yes service. 9=Unknown.
-    vetstat_cat = fcase(
-        vetstat == 0L, "NIU",
-        vetstat == 1L, "No service",
-        vetstat == 2L, "Yes service",
-        default = "Unknown" # Handle 9 or other codes
-    ),
-    # FAMSIZE: Family size. Keep numeric. Handle potential high codes (e.g., 99) if they mean NIU.
     famsize = fifelse(famsize >= 99L, NA_integer_, as.integer(famsize)),
-    # NCHILD: Number of own children. Keep numeric. Handle potential high codes.
     nchild = fifelse(nchild >= 99L, NA_integer_, as.integer(nchild)),
-    # DIFFANY: Any difficulty. 0=NIU, 1=No, 2=Yes.
     diff_cat = fcase(
         diffany == 0L, "NIU",
         diffany == 1L, "No difficulty",
         diffany == 2L, "Has difficulty",
         default = "Unknown"
     ),
-    # PROFCERT: Professional certification. 0=NIU, 1=No, 2=Yes.
-    profcert_cat = fcase(
-        profcert == 0L, "NIU",
-        profcert == 1L, "No certification",
-        profcert == 2L, "Has certification",
-        default = "Unknown"
-    ),
-    # CLASSWKR: Class of worker. Simplify. 10/13/14=Self/Unpaid; 21/22=Private; 25-28=Govt.
     classwkr_cat = fcase(
-        classwkr %in% c(10L, 13L, 14L), "Self-employed/Unpaid", # Inc/Not Inc/Unpaid Family
-        classwkr %in% c(21L, 22L), "Private", # Profit/Non-Profit
-        classwkr %in% c(25L, 27L, 28L), "Government", # Fed/State/Local
-        classwkr == 29, "Government", # Include Govt unspecified if present
-        default = "Other/NIU" # Handle 0 (NIU) or unemployed (not applicable)
+        classwkr %in% c(10L, 13L, 14L), "Self-employed/Unpaid",
+        classwkr %in% c(21L, 22L), "Private",
+        classwkr %in% c(25L, 27L, 28L), "Government",
+        classwkr == 29L, "Government",
+        default = "Other/NIU"
     ),
-    # OCC1990: Convert to numeric for grouping
     occ1990 = as.numeric(occ1990),
-    # WTFINL: Ensure weight is numeric
     wtfinl = as.numeric(wtfinl)
   )]
 
-  # Create race_cat from race (treating numeric codes as factors)
   cps[, race_cat := as.factor(race)]
 
-  # Derive ind_group_cat after ind1990 is numeric
-  # Based on IND1990 codes
   cps[, ind_group_cat := fcase(
-    ind1990 >= 10 & ind1990 <= 32, "Agr, Forest, Fish",
-    ind1990 >= 40 & ind1990 <= 50, "Mining",
-    ind1990 == 60, "Construction",
-    ind1990 >= 100 & ind1990 <= 392, "Manufacturing",
-    ind1990 >= 400 & ind1990 <= 472, "Transport, Comm, Util",
-    ind1990 >= 500 & ind1990 <= 571, "Wholesale Trade",
-    ind1990 >= 580 & ind1990 <= 691, "Retail Trade",
-    ind1990 >= 700 & ind1990 <= 712, "Finance, Ins, Real Estate",
-    ind1990 >= 721 & ind1990 <= 760, "Business & Repair Svcs",
-    ind1990 >= 761 & ind1990 <= 791, "Personal Svcs",
-    ind1990 >= 800 & ind1990 <= 810, "Entertainment & Rec Svcs",
-    ind1990 >= 812 & ind1990 <= 893, "Professional & Related Svcs",
-    ind1990 >= 900 & ind1990 <= 932, "Public Administration",
-    ind1990 >= 940 & ind1990 <= 960, "Active Duty Military", # Sometimes excluded
-    ind1990 == 991 | ind1990 == 992, "Unemployed/NIU", # Handle unemployed code if present
-    default = NA_character_ # Other codes (e.g., 0) become NA
+    ind1990 >= 10L & ind1990 <= 32L, "Agr, Forest, Fish",
+    ind1990 >= 40L & ind1990 <= 50L, "Mining",
+    ind1990 == 60L, "Construction",
+    ind1990 >= 100L & ind1990 <= 392L, "Manufacturing",
+    ind1990 >= 400L & ind1990 <= 472L, "Transport, Comm, Util",
+    ind1990 >= 500L & ind1990 <= 571L, "Wholesale Trade",
+    ind1990 >= 580L & ind1990 <= 691L, "Retail Trade",
+    ind1990 >= 700L & ind1990 <= 712L, "Finance, Ins, Real Estate",
+    ind1990 >= 721L & ind1990 <= 760L, "Business & Repair Svcs",
+    ind1990 >= 761L & ind1990 <= 791L, "Personal Svcs",
+    ind1990 >= 800L & ind1990 <= 810L, "Entertainment & Rec Svcs",
+    ind1990 >= 812L & ind1990 <= 893L, "Professional & Related Svcs",
+    ind1990 >= 900L & ind1990 <= 932L, "Public Administration",
+    ind1990 >= 940L & ind1990 <= 960L, "Active Duty Military",
+    ind1990 == 991L | ind1990 == 992L, "Unemployed/NIU",
+    default = NA_character_
   )]
-  # Remove original ind_group if it existed from a previous run or intermediate step
   if ("ind_group" %in% names(cps)) cps[, ind_group := NULL]
 
 
-  # Derive occ_group_cat and ensure wtfinl is numeric
-  # Based on OCC1990 codes
   cps[, occ_group_cat := fcase(
-      occ1990 >= 3 & occ1990 <= 194, "Managerial/Professional", # Range adjusted based on OCC1990 detail
-      occ1990 >= 203 & occ1990 <= 389, "Technical/Sales/Admin Support",
-      occ1990 >= 403 & occ1990 <= 469, "Service Occupations",
-      occ1990 >= 473 & occ1990 <= 498, "Farming/Forestry/Fishing",
-      occ1990 >= 503 & occ1990 <= 699, "Precision Prod/Craft/Repair",
-      occ1990 >= 703 & occ1990 <= 889, "Operators/Fabricators/Laborers",
-      occ1990 >= 900, "Military Occupations", # If applicable
+      occ1990 >= 3L & occ1990 <= 194L, "Managerial/Professional",
+      occ1990 >= 203L & occ1990 <= 389L, "Technical/Sales/Admin Support",
+      occ1990 >= 403L & occ1990 <= 469L, "Service Occupations",
+      occ1990 >= 473L & occ1990 <= 498L, "Farming/Forestry/Fishing",
+      occ1990 >= 503L & occ1990 <= 699L, "Precision Prod/Craft/Repair",
+      occ1990 >= 703L & occ1990 <= 889L, "Operators/Fabricators/Laborers",
+      occ1990 >= 900L, "Military Occupations",
       default = NA_character_
   )]
-  # Remove original occ_group if it existed
   if ("occ_group" %in% names(cps)) cps[, occ_group := NULL]
 
+  # --- Remove original source variables EARLY ---
+  message("Removing original source variables after deriving categories...")
+  cols_to_remove_early <- c("year", "month", "empstat", "labforce", "race", "occ1990", "ind1990",
+                            "hispan", "educ", "relate", "metro", "cbsasz", "marst", "citizen",
+                            "diffany", "classwkr", # Removed nativity, diffmob
+                            "mish")
+  existing_cols_to_remove_early <- intersect(cols_to_remove_early, names(cps))
+  if (length(existing_cols_to_remove_early) > 0) {
+      message("Removing early: ", paste(existing_cols_to_remove_early, collapse=", "))
+      cps[, (existing_cols_to_remove_early) := NULL]
+      gc()
+  }
+  # -----------------------------------------------------------
 
   # --- Aggregate Rate Calculations ---
   message("Calculating weighted labor force aggregates using data.table...")
-
-  # Ensure weight is not NA for calculations, replace with 0 if necessary (or handle appropriately)
-  cps[is.na(wtfinl), wtfinl := 0]
-
-  # Define labor force: emp + unemp
   cps[, lf := emp + unemp]
+  cps_in_lf <- cps[lf == 1L] # Subset for efficiency
 
-  # Calculate state and industry rates efficiently
-  # Filter out NA ind_group_cat before grouping
-  rates_ind <- cps[!is.na(ind_group_cat) & lf == 1L, .(
+  rates_ind <- cps_in_lf[!is.na(ind_group_cat), .(
     state_ind_emp_w = sum(wtfinl * emp, na.rm = TRUE),
     state_ind_unemp_w = sum(wtfinl * unemp, na.rm = TRUE),
-    state_ind_lf_w = sum(wtfinl, na.rm = TRUE) # Sum weights of those in LF
-  ), by = .(date, statefip, ind_group_cat)] # Use ind_group_cat
+    state_ind_lf_w = sum(wtfinl, na.rm = TRUE)
+  ), by = .(date, statefip, ind_group_cat)]
 
-  # Aggregate to state level (using only people in the labor force)
-  state_rates <- cps[lf == 1L, .(
+  state_rates <- cps_in_lf[, .(
     state_emp_w = sum(wtfinl * emp, na.rm = TRUE),
     state_unemp_w = sum(wtfinl * unemp, na.rm = TRUE),
     state_lf_w = sum(wtfinl, na.rm = TRUE)
   ), by = .(date, statefip)]
 
-  state_rates[, `:=`(
-    state_unemp_rate = fifelse(state_lf_w > 0, state_unemp_w / state_lf_w, NA_real_),
-    state_emp_rate = fifelse(state_lf_w > 0, state_emp_w / state_lf_w, NA_real_) # Emp rate = Emp / LF
-  )]
-  # Select columns to merge
-  state_rates <- state_rates[, .(date, statefip, state_unemp_rate, state_emp_rate)]
+  state_rates[, state_unemp_rate := fifelse(state_lf_w > 0, state_unemp_w / state_lf_w, NA_real_)]
+  setorder(state_rates, statefip, date)
+  state_rates[, state_emp_w_lag := shift(state_emp_w, type = "lag"), by = statefip]
+  state_rates[, state_emp_pctchg := fifelse(!is.na(state_emp_w_lag) & state_emp_w_lag > 0, state_emp_w / state_emp_w_lag, 1.0)]
+  state_rates[is.nan(state_emp_pctchg) | is.infinite(state_emp_pctchg), state_emp_pctchg := 1.0]
+  state_rates[, state_emp_w_lag := NULL]
+  state_rates_to_merge <- state_rates[, .(date, statefip, state_unemp_rate, state_emp_pctchg)]
+  rm(state_rates); gc()
 
-  # Aggregate to industry level (using only people in the labor force and valid industry)
   industry_rates <- rates_ind[, .(
     ind_group_emp_w = sum(state_ind_emp_w, na.rm = TRUE),
     ind_group_unemp_w = sum(state_ind_unemp_w, na.rm = TRUE),
     ind_group_lf_w = sum(state_ind_lf_w, na.rm = TRUE)
-  ), by = .(date, ind_group_cat)] # Use ind_group_cat
+  ), by = .(date, ind_group_cat)]
+  rm(rates_ind); gc()
+  setorder(industry_rates, ind_group_cat, date)
+  industry_rates[, ind_emp_w_lag := shift(ind_group_emp_w, type = "lag"), by = ind_group_cat]
+  industry_rates[, ind_emp_pctchg := fifelse(!is.na(ind_emp_w_lag) & ind_emp_w_lag > 0, ind_group_emp_w / ind_emp_w_lag, 1.0)]
+  industry_rates[is.nan(ind_emp_pctchg) | is.infinite(ind_emp_pctchg), ind_emp_pctchg := 1.0]
+  industry_rates[, ind_emp_w_lag := NULL]
+  industry_rates_to_merge <- industry_rates[, .(date, ind_group_cat, ind_emp_pctchg)]
+  rm(industry_rates); gc()
 
-  industry_rates[, `:=`(
-    ind_group_unemp_rate = fifelse(ind_group_lf_w > 0, ind_group_unemp_w / ind_group_lf_w, NA_real_),
-    ind_group_emp_rate = fifelse(ind_group_lf_w > 0, ind_group_emp_w / ind_group_lf_w, NA_real_)
-  )]
-  # Select columns to merge
-  industry_rates <- industry_rates[, .(date, ind_group_cat, ind_group_unemp_rate, ind_group_emp_rate)] # Use ind_group_cat
-
-  # Aggregate to national level (using only people in the labor force)
-  national_rates <- cps[lf == 1L, .(
-      national_emp_w = sum(wtfinl * emp, na.rm = TRUE),
-      national_unemp_w = sum(wtfinl * unemp, na.rm = TRUE),
-      national_lf_w = sum(wtfinl, na.rm = TRUE)
+  national_rates <- cps_in_lf[, .(
+      national_emp_w    = sum(wtfinl * emp,   na.rm = TRUE),
+      national_unemp_w  = sum(wtfinl * unemp, na.rm = TRUE),
+      national_lf_w     = sum(wtfinl,         na.rm = TRUE)
   ), by = date]
+  national_rates[, national_unemp_rate := fifelse(national_lf_w > 0, national_unemp_w / national_lf_w, NA_real_)]
+  setorder(national_rates, date)
+  national_rates[, national_emp_w_lag := shift(national_emp_w, type = "lag")]
+  national_rates[, national_emp_pctchg := fifelse(!is.na(national_emp_w_lag) & national_emp_w_lag > 0, national_emp_w / national_emp_w_lag, 1.0)]
+  national_rates[is.nan(national_emp_pctchg) | is.infinite(national_emp_pctchg), national_emp_pctchg := 1.0]
+  national_rates[, national_emp_w_lag := NULL]
+  national_rates_base <- unique(national_rates[, .(date, national_unemp_rate, national_emp_pctchg)])
+  setorder(national_rates_base, date)
+  rm(national_rates, cps_in_lf); gc()
 
-  national_rates[, `:=`(
-      national_unemp_rate = fifelse(national_lf_w > 0, national_unemp_w / national_lf_w, NA_real_),
-      national_emp_rate = fifelse(national_lf_w > 0, national_emp_w / national_lf_w, NA_real_)
-  )]
-  # Select columns and ensure unique by date
-  national_rates <- unique(national_rates[, .(date, national_unemp_rate, national_emp_rate)])
-  setorder(national_rates, date) # Ensure chronological order
+  message("Calculating national transition percentages since last period...")
+  cps[, state := fcase(emp == 1L, "E", unemp == 1L, "U", nilf == 1L, "NE")]
+  setkey(cps, cpsidp, date)
+  cps[, state_next := shift(state, type = "lead"), by = cpsidp]
+  trans_natl <- cps[!is.na(state_next) & !is.na(state) & wtfinl > 0,
+    .(w = sum(wtfinl, na.rm = TRUE)),
+    by = .(date, state, state_next)
+  ]
+  trans_start_totals <- trans_natl[, .(total_w = sum(w)), by = .(date, state)]
+  trans_pct <- trans_natl[trans_start_totals, on = .(date, state)]
+  trans_pct[, perc := fifelse(total_w > 0, w / total_w, 0)]
+  trans_pct[, `:=`(w = NULL, total_w = NULL)]
+  rm(trans_natl, trans_start_totals); gc()
+  # Filter out transitions starting from NE before casting
+  trans_wide <- dcast(trans_pct[state != "NE"], date ~ paste0(state, "_", state_next), value.var = "perc", fill = 0)
+  rm(trans_pct); gc()
+  national_rates_final <- national_rates_base[trans_wide, on = "date"]
+  rm(national_rates_base, trans_wide); gc()
 
-  # --- Save National Rates ---
   if (!is.null(national_rates_output_path)) {
     message("Saving national aggregate rates to: ", national_rates_output_path)
     tryCatch({
       dir.create(dirname(national_rates_output_path), recursive = TRUE, showWarnings = FALSE)
-      fwrite(national_rates, file = national_rates_output_path)
+      fwrite(national_rates_final, file = national_rates_output_path)
     }, error = function(e) {
       warning("Failed to save national rates file: ", e$message)
     })
@@ -611,53 +555,182 @@ process_cps_data <- function(cps, national_rates_output_path = NULL) {
     message("National rates output path not provided, skipping save.")
   }
 
-  # --- Merge Rates Back (Optional for individual data, keep for consistency) ---
-  message("Merging aggregate rates onto individual data using data.table joins...")
-  # Use on= to specify join columns, use i. prefix for incoming columns
-  cps[national_rates, on = "date", `:=`(national_unemp_rate = i.national_unemp_rate, national_emp_rate = i.national_emp_rate)]
-  cps[state_rates, on = c("date", "statefip"), `:=`(state_unemp_rate = i.state_unemp_rate, state_emp_rate = i.state_emp_rate)]
-  cps[industry_rates, on = c("date", "ind_group_cat"), `:=`(ind_group_unemp_rate = i.ind_group_unemp_rate, ind_group_emp_rate = i.ind_group_emp_rate)] # Use ind_group_cat
+  message("Removing intermediate columns (lf, state, state_next) before merging...")
+  intermediate_cols <- c("lf", "state", "state_next")
+  existing_intermediate_cols <- intersect(intermediate_cols, names(cps))
+  if (length(existing_intermediate_cols) > 0) {
+      cps[, (existing_intermediate_cols) := NULL]
+  }
+  gc()
 
-  # Remove the intermediate labor force flag
-  cps[, lf := NULL]
+  # --- Merge Rates Back using Incremental Binding --- ## MODIFIED SECTION ##
+  message("Merging aggregate rates onto individual data using incremental binding...")
 
-  # --- Validation and Cleanup ---
+  # Add year column for splitting
+  cps[, year := year(date)]
+  years <- sort(unique(cps$year)) # Sort years for sequential processing
+
+  # Validate if any years exist
+  if (length(years) == 0) {
+      warning("No years found in the data to process for incremental binding.")
+      # Depending on desired behavior, could return empty table or stop
+      return(cps[, year := NULL]) # Return table with year column removed if it was added
+  }
+
+  # Initialize the final table with the first year's processed data
+  first_year <- years[1]
+  message("  Processing and initializing with first chunk: ", first_year)
+
+  # Use explicit filtering to create the initial table and the remainder
+  cps_final_combined <- cps[year == first_year]
+  if (length(years) > 1) {
+    cps <- cps[year != first_year] # Keep the rest only if there are more years
+  } else {
+    cps <- data.table() # Empty table if only one year
+  }
+  gc() # Clean up memory
+
+  # --- Process the initial chunk ---
+  if (nrow(cps_final_combined) > 0) { # Check if first chunk has data
+      # Define transition columns dynamically (needed inside the scope accessing national_rates_final)
+      base_national_cols <- c("date", "national_unemp_rate", "national_emp_pctchg")
+      transition_cols_to_merge <- setdiff(names(national_rates_final), base_national_cols)
+      cols_to_add_national <- c("national_unemp_rate", "national_emp_pctchg", transition_cols_to_merge)
+      cols_from_i_national <- paste0("i.", cols_to_add_national) # Prefix for join source cols
+
+      cols_to_add_state <- c("state_unemp_rate", "state_emp_pctchg")
+      cols_from_i_state <- paste0("i.", cols_to_add_state) # Prefix for join source cols
+
+
+      setkey(cps_final_combined, date) # Key for national join
+      # Ensure columns exist before trying to merge them
+      valid_national_cols <- intersect(cols_to_add_national, names(national_rates_final))
+      valid_national_i_cols <- paste0("i.", valid_national_cols)
+      if(length(valid_national_cols) > 0) {
+          cps_final_combined[national_rates_final, on = "date", (valid_national_cols) := mget(valid_national_i_cols)]
+      }
+
+      setkey(cps_final_combined, date, statefip) # Key for state join
+      valid_state_cols <- intersect(cols_to_add_state, names(state_rates_to_merge))
+      valid_state_i_cols <- paste0("i.", valid_state_cols)
+       if(length(valid_state_cols) > 0) {
+          cps_final_combined[state_rates_to_merge, on = c("date", "statefip"), (valid_state_cols) := mget(valid_state_i_cols)]
+      }
+
+      setkey(cps_final_combined, date, ind_group_cat) # Key for industry join
+      if ("ind_emp_pctchg" %in% names(industry_rates_to_merge)) {
+         cps_final_combined[industry_rates_to_merge, on = c("date", "ind_group_cat"), `:=`(ind_emp_pctchg = i.ind_emp_pctchg)]
+      }
+  } else {
+       message("    First chunk (year ", first_year, ") was empty. Initializing empty result table.")
+       # Ensure cps_final_combined is an empty data.table if the first chunk was empty
+       cps_final_combined <- data.table()
+  }
+  # --- End processing initial chunk ---
+
+
+  # Loop through remaining years
+  if (length(years) > 1 && nrow(cps) > 0) { # Check if there's remaining data
+      # Re-define merge columns here in case they weren't defined due to empty first chunk
+      base_national_cols <- c("date", "national_unemp_rate", "national_emp_pctchg")
+      transition_cols_to_merge <- setdiff(names(national_rates_final), base_national_cols)
+      cols_to_add_national <- c("national_unemp_rate", "national_emp_pctchg", transition_cols_to_merge)
+      cols_from_i_national <- paste0("i.", cols_to_add_national)
+      cols_to_add_state <- c("state_unemp_rate", "state_emp_pctchg")
+      cols_from_i_state <- paste0("i.", cols_to_add_state)
+
+      for (yr in years[-1]) {
+          message("  Processing and binding chunk for year: ", yr)
+          chunk <- cps[year == yr]
+          # Check if this slice actually produced data
+          if (nrow(chunk) == 0) {
+              message("    Chunk for year ", yr, " is empty. Skipping.")
+              # Explicitly remove the year from the remaining data even if empty
+              cps <- cps[year != yr]
+              gc()
+              next # Skip to the next year
+          }
+          # Remove the processed year from the remaining pool
+          cps <- cps[year != yr]
+          gc()
+
+          # Process the current chunk (same merge logic as above)
+          setkey(chunk, date)
+          valid_national_cols <- intersect(cols_to_add_national, names(national_rates_final))
+          valid_national_i_cols <- paste0("i.", valid_national_cols)
+          if(length(valid_national_cols) > 0) {
+            chunk[national_rates_final, on = "date", (valid_national_cols) := mget(valid_national_i_cols)]
+          }
+
+          setkey(chunk, date, statefip)
+          valid_state_cols <- intersect(cols_to_add_state, names(state_rates_to_merge))
+          valid_state_i_cols <- paste0("i.", valid_state_cols)
+           if(length(valid_state_cols) > 0) {
+            chunk[state_rates_to_merge, on = c("date", "statefip"), (valid_state_cols) := mget(valid_state_i_cols)]
+          }
+
+          setkey(chunk, date, ind_group_cat)
+           if ("ind_emp_pctchg" %in% names(industry_rates_to_merge)) {
+             chunk[industry_rates_to_merge, on = c("date", "ind_group_cat"), `:=`(ind_emp_pctchg = i.ind_emp_pctchg)]
+           }
+
+          # Bind the processed chunk to the main table
+          message("    Binding chunk...")
+          # Ensure cps_final_combined exists before binding
+          if (nrow(cps_final_combined) == 0) {
+              cps_final_combined <- chunk # Assign first non-empty chunk
+          } else {
+              cps_final_combined <- rbindlist(list(cps_final_combined, chunk), use.names = TRUE, fill = FALSE)
+          }
+          message("    Done binding. Total rows: ", nrow(cps_final_combined))
+          rm(chunk); gc() # Clean up aggressively
+      }
+  }
+
+  # Clean up intermediate rate tables and remaining original data remnants
+  rm(national_rates_final, state_rates_to_merge, industry_rates_to_merge, cps); gc()
+
+  # Remove temporary year column if it exists
+  if ("year" %in% names(cps_final_combined)) {
+      cps_final_combined[, year := NULL]
+  }
+  message("Finished merging rates via incremental binding.")
+
+  # --- Validation and Cleanup (use cps_final_combined now) ---
   message("Performing final validation and cleanup...")
-  # Create validation column using data.table
-  # This checks if exactly one status (emp, unemp, nilf) is 1
+  cps <- cps_final_combined # Assign back to 'cps' for rest of function
+  rm(cps_final_combined); gc()
+  # Check if cps actually contains data before proceeding
+   if (nrow(cps) == 0) {
+      warning("Data table is empty after merging process. Skipping validation and returning empty table.")
+      return(cps) # Return the empty table
+  }
+
+  # Validation columns
   cps[, status_check := emp + unemp + nilf]
   cps[, status_error := fifelse(status_check != 1L, 1L, 0L)]
 
-  # Report any errors in classification
   error_count <- sum(cps$status_error, na.rm = TRUE)
   if(error_count > 0) {
-    warning(paste0("Found ", error_count, " records with inconsistent employment classifications (emp+unemp+nilf != 1). Check raw EMPSTAT/LABFORCE values for these cases."))
-    # Optional: View inconsistent records
-    # print(cps[status_error == 1L, .(cpsidp, date, empstat, labforce, emp, unemp, nilf)])
+    warning(paste0("Found ", error_count, " records with inconsistent employment classifications (emp+unemp+nilf != 1)."))
   }
 
-  # Remove validation columns and original source variables that have been categorized/processed
-  cols_to_remove <- c("status_check", "status_error", "year", "month", "empstat", "labforce",
-                      "race", "occ1990", "ind1990", "hispan", "educ", "relate", "metro", "cbsasz", "marst", # Add race
-                      "citizen", "nativity", "vetstat", "diffmob", "diffany", "profcert", "classwkr")
-  existing_cols_to_remove <- intersect(cols_to_remove, names(cps))
-  if (length(existing_cols_to_remove) > 0) {
-      message("Removing intermediate/redundant columns: ", paste(existing_cols_to_remove, collapse=", "))
-      cps[, (existing_cols_to_remove) := NULL]
+  cols_to_remove_final <- c("status_check", "status_error")
+  existing_cols_to_remove_final <- intersect(cols_to_remove_final, names(cps))
+  if (length(existing_cols_to_remove_final) > 0) {
+      message("Removing final intermediate columns: ", paste(existing_cols_to_remove_final, collapse=", "))
+      cps[, (existing_cols_to_remove_final) := NULL]
   }
 
-  # Check and remove duplicates using data.table::unique (should be minimal after get_cps_data filtering)
   message("De-duplicating data (if any duplicates remain)...")
   n_before <- nrow(cps)
-  # Ensure keys are set for unique, or specify by argument
-  setkey(cps, cpsidp, date) # Ensure keys are set
+  setkey(cps, cpsidp, date)
   cps <- unique(cps, by = key(cps))
   n_after <- nrow(cps)
   if (n_before > n_after) {
       message("Removed ", n_before - n_after, " duplicate observations (based on cpsidp, date)")
   }
 
-  # Return data.table
   message("Finished processing variables. Returning data.table.")
   return(cps)
 }
@@ -668,58 +741,86 @@ process_cps_data <- function(cps, national_rates_output_path = NULL) {
 #' @param cps Processed CPS data.table (output from process_cps_data)
 #' @return Filtered CPS data.table with lead variables and employment states
 add_lead_variables <- function(cps) {
-  # Ensure input is a data.table and sorted
   if (!is.data.table(cps)) setDT(cps)
+   # Check if input is empty
+  if (nrow(cps) == 0) {
+    warning("Input data to add_lead_variables is empty. Returning empty data.table.")
+    # Need to ensure expected output columns exist, even if empty
+    expected_cols <- c("cpsidp", "date", "wtfinl", "age", "sex", "race_cat", "statefip", "mth_dim1", "mth_dim2",
+                       "hispan_cat", "educ_cat", "durunemp", "ind_group_cat", "occ_group_cat", "relate_cat",
+                       "metro_cat", "cbsasz_cat", "marst_cat", "citizen_cat",
+                       "famsize", "nchild", "diff_cat", "classwkr_cat", "national_unemp_rate",
+                       "state_unemp_rate", "state_emp_pctchg", "ind_emp_pctchg", "national_emp_pctchg",
+                       "emp_state", "emp_state_f1") # Add known transition cols if predictable, else they won't exist
+     # Find transition columns if they exist in the (empty) input
+     # Exclude NE_E and NE_U from expected columns even if present in input (they shouldn't be)
+    transition_cols_in_input <- grep("^[EU]{1}_[EUN]{1,2}$", names(cps), value = TRUE) # Only E_* and U_*
+    final_expected_cols <- c(expected_cols, transition_cols_in_input)
+    # Create an empty data table with these columns
+    empty_dt <- data.table(matrix(ncol = length(final_expected_cols), nrow = 0))
+    setnames(empty_dt, final_expected_cols)
+    return(empty_dt)
+  }
   setkey(cps, cpsidp, date)
 
   message("Adding lead variables using data.table...")
-
-  # Define columns for which to create leads (key demographics + status indicators)
-  # Use the newly created categorical variables where appropriate (e.g., hispan_cat, race_cat)
-  lead_cols_demog <- c("age", "sex", "race_cat", "hispan_cat") # Use race_cat
-  lead_cols_status <- c("emp", "unemp", "nilf")
+  lead_cols_demog <- c("age", "sex", "race_cat", "hispan_cat")
+  lead_cols_status <- c("emp", "unemp", "nilf") # Still need these binary flags temporarily
   lead_cols <- c(lead_cols_demog, lead_cols_status)
-
-  # Generate names for the new lead columns
   lead_cols_new_names <- paste0(lead_cols, "_f1")
 
-  # Create lead variables using data.table::shift within each individual's timeline
+  # Ensure lead columns exist before trying to operate on them
+  missing_lead_cols <- setdiff(lead_cols, names(cps))
+   if(length(missing_lead_cols) > 0){
+      stop("Error in add_lead_variables: Missing required columns to create leads: ", paste(missing_lead_cols, collapse=", "))
+   }
+
+
   cps[, (lead_cols_new_names) := shift(.SD, n = 1L, type = "lead"), .SDcols = lead_cols, by = cpsidp]
 
   message("Creating current and future employment state categories...")
-  # Create categorical employment state variables using fcase
   cps[, `:=`(
     emp_state = fcase(
       emp == 1L, "Employed",
       unemp == 1L, "Unemployed",
       nilf == 1L, "Not in Labor Force",
-      default = NA_character_ # Should not happen if status_error check passed
+      default = NA_character_
     ),
     emp_state_f1 = fcase(
       emp_f1 == 1L, "Employed",
       unemp_f1 == 1L, "Unemployed",
       nilf_f1 == 1L, "Not in Labor Force",
-      default = NA_character_ # Will be NA if person not observed next month
+      default = NA_character_
     )
   )]
 
   message("Filtering to matched individuals with valid future state and consistent demographics...")
   rows_before <- nrow(cps)
 
-  # Filter using data.table syntax:
-  # 1. Keep only rows where the next month's state is known (!is.na(emp_state_f1))
-  # 2. Keep only rows where key demographics are consistent between months
-  #    (allowing for age to increase by 1 is complex, easier to check equality for short panels)
-  #    Need to handle NA comparisons correctly
+  is_equal_or_both_na <- function(a, b) {
+    (a == b) | (is.na(a) & is.na(b))
+  }
+
+  # Need to handle cases where lead variables (_f1) might not exist if shift failed or original col missing
+  # Check required _f1 columns exist before filtering
+  required_f1_cols <- c("emp_state_f1", "age_f1", "sex_f1", "race_cat_f1", "hispan_cat_f1")
+  missing_f1_cols <- setdiff(required_f1_cols, names(cps))
+   if(length(missing_f1_cols) > 0){
+       warning("Missing expected lead (_f1) columns for filtering: ", paste(missing_f1_cols, collapse=", "), ". Filtering might be incomplete.")
+       # Handle missing columns gracefully in the filter expression if necessary, e.g., default to FALSE
+       # For simplicity here, we'll assume the columns *should* exist if the leads were created.
+       # A more robust approach might involve conditional filtering.
+   }
+
+  # Proceed with filtering, assuming columns exist (or handle NAs appropriately)
   cps_final <- cps[
-    !is.na(emp_state_f1) & # Future state must be known
-    age == age_f1 &        # Age should be identical (short panel assumption)
-    sex == sex_f1 &        # Sex should be identical
-    # Compare categorical race status, handle NAs
-    ((race_cat == race_cat_f1) | (is.na(race_cat) & is.na(race_cat_f1))) &
-    # Compare categorical hispanic status, handle NAs
-    ((hispan_cat == hispan_cat_f1) | (is.na(hispan_cat) & is.na(hispan_cat_f1)))
+    !is.na(emp_state_f1) &
+    age == age_f1 & # Direct comparison
+    sex == sex_f1 & # Direct comparison
+    is_equal_or_both_na(race_cat, race_cat_f1) & # Use helper for potential NAs
+    is_equal_or_both_na(hispan_cat, hispan_cat_f1) # Use helper for potential NAs
   ]
+
 
   rows_after <- nrow(cps_final)
   reduction_pct <- if (rows_before > 0) round((rows_before - rows_after) / rows_before * 100, 1) else 0
@@ -727,12 +828,13 @@ add_lead_variables <- function(cps) {
           " (", reduction_pct, "% reduction)")
 
   # Remove temporary lead columns and intermediate binary status indicators
-  cols_to_remove <- c(lead_cols_new_names, "emp", "unemp", "nilf", "mish") # Remove originals too
+  cols_to_remove <- c(lead_cols_new_names, "emp", "unemp", "nilf")
   existing_cols_to_remove <- intersect(names(cps_final), cols_to_remove)
   if (length(existing_cols_to_remove) > 0) {
     message("Removing temporary lead/intermediate columns: ", paste(existing_cols_to_remove, collapse=", "))
     cps_final[, (existing_cols_to_remove) := NULL]
   }
+  gc()
 
   message("Finished creating lead variables and filtering.")
   return(cps_final)
@@ -744,7 +846,11 @@ add_lead_variables <- function(cps) {
 #' @param data CPS data.table (output from add_lead_variables)
 #' @return Data.table with labeled variables using attributes
 label_variables <- function(data) {
-    if (!is.data.table(data)) setDT(data) # Ensure it's a data.table
+    if (!is.data.table(data)) setDT(data)
+    if (nrow(data) == 0) {
+        message("Input data is empty, skipping labeling.")
+        return(data) # Return empty data as is
+    }
 
     message("Adding variable labels...")
 
@@ -755,36 +861,42 @@ label_variables <- function(data) {
         wtfinl = "Final Person Weight",
         age = "Age",
         sex = "Sex (1=Male, 2=Female)",
-        race_cat = "Race (Categorical, based on IPUMS codes)", # Add race_cat
+        race_cat = "Race (Categorical, based on IPUMS codes)",
         statefip = "State FIPS Code",
         mth_dim1 = "Month Sine Component (Cyclical Encoding)",
         mth_dim2 = "Month Cosine Component (Cyclical Encoding)",
         hispan_cat = "Hispanic Origin (Categorical)",
         educ_cat = "Educational Attainment (Categorical)",
         durunemp = "Duration of Unemployment in Weeks (0 if Employed/NILF)",
-        ind_group_cat = "Industry Group (Categorical, based on IND1990)", # Update name
-        occ_group_cat = "Occupation Group (Categorical, based on OCC1990)", # Update name
+        ind_group_cat = "Industry Group (Categorical, based on IND1990)",
+        occ_group_cat = "Occupation Group (Categorical, based on OCC1990)",
         relate_cat = "Relationship to Household Head (Categorical)",
         metro_cat = "Metropolitan Status (Categorical)",
         cbsasz_cat = "CBSA Size Category (Categorical)",
         marst_cat = "Marital Status (Categorical)",
         citizen_cat = "Citizenship Status (Categorical)",
-        nativity_cat = "Nativity (Native/Foreign Born)",
-        vetstat_cat = "Veteran Status (Categorical)",
         famsize = "Family Size (Numeric)",
         nchild = "Number of Own Children in Household (Numeric)",
         diff_cat = "Any Difficulty Reported (Yes/No/NIU)",
-        profcert_cat = "Professional Certification Reported (Yes/No/NIU)",
         classwkr_cat = "Class of Worker (Categorical)",
         national_unemp_rate = "Monthly National Unemployment Rate (Weighted)",
-        national_emp_rate = "Monthly National Employment Rate (Weighted, Emp/LF)",
         state_unemp_rate = "Monthly State Unemployment Rate (Weighted)",
-        state_emp_rate = "Monthly State Employment Rate (Weighted, Emp/LF)",
-        ind_group_unemp_rate = "Monthly Industry Group Unemployment Rate (Weighted)",
-        ind_group_emp_rate = "Monthly Industry Group Employment Rate (Weighted, Emp/LF)",
+        state_emp_pctchg = "Monthly State Employment Level Ratio (Current/Previous)",
+        ind_emp_pctchg = "Monthly Industry Group Employment Level Ratio (Current/Previous)",
+        national_emp_pctchg = "Monthly National Employment Level Ratio (Current/Previous)",
+        # Dynamic transition labels
+        E_E = "National E->E Transition Pct (% of prior E pop)",
+        E_U = "National E->U Transition Pct (% of prior E pop)",
+        E_NE = "National E->NE Transition Pct (% of prior E pop)",
+        U_E = "National U->E Transition Pct (% of prior U pop)",
+        U_U = "National U->U Transition Pct (% of prior U pop)",
+        U_NE = "National U->NE Transition Pct (% of prior U pop)",
+        # NE_E label removed
+        # NE_U label removed
+        NE_NE = "National NE->NE Transition Pct (% of prior NE pop)", # Keep NE_NE if needed, otherwise remove
+        # Final state variables
         emp_state = "Current Month Employment Status (Categorical)",
         emp_state_f1 = "Next Month Employment Status (Categorical)"
-        # Remove label for 'race' if it existed
     )
 
     # Apply labels using setattr
@@ -793,8 +905,6 @@ label_variables <- function(data) {
             setattr(data[[var_name]], "label", var_labels[[var_name]])
         }
     }
-
-    # Could also add labels for original coded variables if they were kept
 
     message("Finished labeling variables.")
     return(data)

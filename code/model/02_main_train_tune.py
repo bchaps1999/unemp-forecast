@@ -198,7 +198,11 @@ def train_and_evaluate_internal(hparams: dict, trial: optuna.Trial = None):
 
         # --- Step 5: Setup Training Components ---
         # Criterion is now created above with weights
-        optimizer = optim.Adam(model.parameters(), lr=hparams['learning_rate'])
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=hparams['learning_rate'],
+            weight_decay=hparams.get('weight_decay', 0.0)  # <<< use the new param
+        )
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 'min', factor=hparams['lr_scheduler_factor'],
             patience=hparams['lr_scheduler_patience'], verbose=True,
@@ -381,6 +385,7 @@ def run_standard_training(args, base_output_dir):
         'focal_loss_gamma': config.FOCAL_LOSS_GAMMA,
         # Add Transition Weight Factor
         'transition_weight_factor': config.TRANSITION_WEIGHT_FACTOR,
+        'weight_decay': config.WEIGHT_DECAY,    # <<< new
     }
 
     # --- Parameter Loading Logic ---

@@ -14,6 +14,7 @@ import math
 import sys
 import gc # Import garbage collector
 from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import LinearRegression # Add import for trend calculation
 
 # Assuming utils.py contains get_device, SequenceDataset, period_to_date, worker_init_fn
 from utils import get_device, SequenceDataset, period_to_date, worker_init_fn
@@ -331,13 +332,13 @@ def sample_states_and_calc_rates(probabilities: torch.Tensor, # Shape (N, C) on 
     return sampled_states_gpu, weighted_unemp_rate.item(), weighted_emp_rate.item() # Return rates as floats
 
 
-# --- New Tensor-Based Group Rate Calculation ---
-def calculate_group_rates_tensor(sampled_states_gpu: torch.Tensor, # Shape (N,) on GPU
+# --- New Tensor-Based Group Stats Calculation ---
+def calculate_group_stats_tensor(sampled_states_gpu: torch.Tensor, # Shape (N,) on GPU
                                  weights_gpu: torch.Tensor, # Shape (N,) on GPU
                                  group_ids_int_gpu: torch.Tensor, # Shape (N,) integer group IDs on GPU
                                  num_groups: int,
                                  metadata: dict):
-    """Calculates WEIGHTED unemployment and employment rates for each group using tensor ops."""
+    """Calculates WEIGHTED unemp rate, emp rate, and emp level for each group."""
     device = sampled_states_gpu.device
     target_map_inverse = metadata.get('target_state_map_inverse', {})
 
@@ -353,10 +354,9 @@ def calculate_group_rates_tensor(sampled_states_gpu: torch.Tensor, # Shape (N,) 
     unemployed_mask = (sampled_states_gpu == unemployed_int)
 
     # Calculate weighted sums per group using torch.bincount
-    # Ensure weights are float32 for bincount
     weights_float_gpu = weights_gpu.float()
 
-    # Sum of weights for employed individuals in each group
+    # Sum of weights for employed individuals in each group (Employment Level)
     employed_weight_per_group = torch.bincount(
         group_ids_int_gpu[employed_mask],
         weights=weights_float_gpu[employed_mask],
@@ -374,15 +374,18 @@ def calculate_group_rates_tensor(sampled_states_gpu: torch.Tensor, # Shape (N,) 
     labor_force_weight_per_group = employed_weight_per_group + unemployed_weight_per_group
 
     # Calculate rates, handle division by zero
-    # Add small epsilon to denominator to avoid NaN from 0/0, result will be 0 anyway.
     epsilon = 1e-9
     unemp_rate_per_group = unemployed_weight_per_group / (labor_force_weight_per_group + epsilon)
     emp_rate_per_group = employed_weight_per_group / (labor_force_weight_per_group + epsilon) # Emp / LF
 
-    # Stack rates into a tensor: shape (num_groups, 2) -> [unemp_rate, emp_rate]
-    group_rates_tensor = torch.stack([unemp_rate_per_group, emp_rate_per_group], dim=1)
+    # clamp rates into [0,1]
+    unemp_rate_per_group = unemp_rate_per_group.clamp(0.0, 1.0)
+    emp_rate_per_group   = emp_rate_per_group.clamp(0.0, 1.0)
 
-    return group_rates_tensor # Return tensor on GPU
+    # Stack stats into a tensor: shape (num_groups, 3) -> [unemp_rate, emp_rate, emp_level]
+    group_stats_tensor = torch.stack([unemp_rate_per_group, emp_rate_per_group, employed_weight_per_group], dim=1)
+
+    return group_stats_tensor # Return tensor on GPU
 
 
 # --- Helper: Find feature indices ---
@@ -407,13 +410,12 @@ def _find_feature_indices(feature_names, target_map_inverse):
         indices['mth_dim1_idx'] = feature_names.index('num__mth_dim1') if 'num__mth_dim1' in feature_names else -1
         indices['mth_dim2_idx'] = feature_names.index('num__mth_dim2') if 'num__mth_dim2' in feature_names else -1
 
-        # Aggregate rate features
+        # Aggregate rate features (only unemployment rates remain)
         indices['nat_unemp_idx'] = feature_names.index('num__national_unemployment_rate') if 'num__national_unemployment_rate' in feature_names else -1
-        indices['nat_emp_idx'] = feature_names.index('num__national_employment_rate') if 'num__national_employment_rate' in feature_names else -1
         indices['state_unemp_idx'] = feature_names.index('num__state_unemployment_rate') if 'num__state_unemployment_rate' in feature_names else -1
-        indices['state_emp_idx'] = feature_names.index('num__state_employment_rate') if 'num__state_employment_rate' in feature_names else -1
-        indices['ind_unemp_idx'] = feature_names.index('num__industry_unemployment_rate') if 'num__industry_unemployment_rate' in feature_names else -1
-        indices['ind_emp_idx'] = feature_names.index('num__industry_employment_rate') if 'num__industry_employment_rate' in feature_names else -1
+
+        # Add pctchg indices
+        indices['ind_emp_pctchg_idx'] = feature_names.index('num__ind_emp_pctchg') if 'num__ind_emp_pctchg' in feature_names else -1
 
         # Categorical features for lookback (Industry, Occupation, Class)
         indices['ind_group_indices'] = {f: i for i, f in enumerate(feature_names) if f.startswith('cat__ind_group_cat_')}
@@ -425,6 +427,14 @@ def _find_feature_indices(feature_names, target_map_inverse):
         indices['ind_unknown_indices'] = {idx for name, idx in indices['ind_group_indices'].items() if any(suffix in name for suffix in unknown_niu_suffixes)}
         indices['occ_unknown_indices'] = {idx for name, idx in indices['occ_group_indices'].items() if any(suffix in name for suffix in unknown_niu_suffixes)}
         indices['classwkr_unknown_indices'] = {idx for name, idx in indices['classwkr_indices'].items() if any(suffix in name for suffix in unknown_niu_suffixes)}
+
+        # New numeric feature indices
+        indices['ind_emp_pctchg_idx'] = feature_names.index('num__ind_emp_pctchg') if 'num__ind_emp_pctchg' in feature_names else -1
+        # Only include transitions starting from E or U
+        for t in ['E_U','E_NE','U_E','U_NE']: # Removed NE_E, NE_U
+            key = f'{t.lower()}_idx'
+            feat = f'num__{t}'
+            indices[key] = feature_names.index(feat) if feat in feature_names else -1
 
     except (ValueError, KeyError) as e:
         print(f"ERROR: Could not find expected feature indices in metadata. Feature causing error: {e}")
@@ -439,10 +449,12 @@ def _find_feature_indices(feature_names, target_map_inverse):
 def update_sequences_and_features_tensor(
     current_sequences_tensor: torch.Tensor, # Shape: (N, S, F), on DEVICE
     sampled_states_gpu: torch.Tensor, # Shape: (N,), on DEVICE
+    weights_gpu: torch.Tensor,                     # New
     state_ids_int_gpu: torch.Tensor, # Shape: (N,), integer state IDs on GPU
     ind_ids_int_gpu: torch.Tensor, # Shape: (N,), integer industry IDs on GPU
-    state_rates_tensor: torch.Tensor, # Shape: (num_states, 2), rates on GPU
-    industry_rates_tensor: torch.Tensor, # Shape: (num_industries, 2), rates on GPU
+    state_stats_tensor: torch.Tensor, # Renamed: Shape (num_states, 3) -> [ur, er, el] (el not used here)
+    industry_stats_tensor: torch.Tensor, # Renamed: Shape (num_industries, 3) -> [ur, er, el]
+    previous_industry_emp_levels_tensor: torch.Tensor, # New: Shape (num_industries,) - Levels from previous step
     overall_sample_unemp_rate: float, # Overall rate for this step (scalar)
     overall_sample_emp_rate: float, # Overall rate for this step (scalar)
     feature_names: list, # Original feature names list
@@ -471,11 +483,10 @@ def update_sequences_and_features_tensor(
     # Pre-extract feature indices
     state_indices_dict = feature_indices['state_indices'] # Dict: {feature_name: index}
     state_indices_values = list(state_indices_dict.values()) # List of indices for state features
-    age_idx, months_last_idx, durunemp_idx = feature_indices['age_idx'], feature_indices['months_last_idx'], feature_indices['durunemp_idx']
-    mth_dim1_idx, mth_dim2_idx = feature_indices['mth_dim1_idx'], feature_indices['mth_dim2_idx']
-    nat_unemp_idx, nat_emp_idx = feature_indices['nat_unemp_idx'], feature_indices['nat_emp_idx']
-    state_unemp_idx, state_emp_idx = feature_indices['state_unemp_idx'], feature_indices['state_emp_idx']
-    ind_unemp_idx, ind_emp_idx = feature_indices['ind_unemp_idx'], feature_indices['ind_emp_idx']
+    age_idx, months_last_idx, durunemp_idx = feature_indices.get('age_idx', -1), feature_indices.get('months_last_idx', -1), feature_indices.get('durunemp_idx', -1)
+    mth_dim1_idx, mth_dim2_idx = feature_indices.get('mth_dim1_idx', -1), feature_indices.get('mth_dim2_idx', -1)
+    nat_unemp_idx, state_unemp_idx = feature_indices.get('nat_unemp_idx', -1), feature_indices.get('state_unemp_idx', -1)
+    ind_emp_pctchg_idx = feature_indices.get('ind_emp_pctchg_idx', -1) # Get index for industry emp % change
 
     # --- Determine next period ---
     current_year = current_period // 100
@@ -558,31 +569,76 @@ def update_sequences_and_features_tensor(
     # 3. Update Aggregate Rate Features ON GPU
     # Update national rates (same for everyone)
     if nat_unemp_idx != -1: new_feature_vectors_gpu[:, nat_unemp_idx] = overall_sample_unemp_rate
-    if nat_emp_idx != -1: new_feature_vectors_gpu[:, nat_emp_idx] = overall_sample_emp_rate
 
-    # Update state rates using gathered values
-    if state_unemp_idx != -1 and state_emp_idx != -1 and state_ids_int_gpu is not None:
-        # Gather rates for each individual based on their state ID index
-        # state_rates_tensor shape: (num_states, 2) -> [unemp_rate, emp_rate]
-        gathered_state_rates = state_rates_tensor[state_ids_int_gpu] # Shape: (N, 2)
-        # Handle potential NaNs/Infs from rate calculation (replace with previous value)
-        nan_mask_state_unemp = torch.isnan(gathered_state_rates[:, 0])
-        nan_mask_state_emp = torch.isnan(gathered_state_rates[:, 1])
-        new_feature_vectors_gpu[:, state_unemp_idx] = torch.where(nan_mask_state_unemp, previous_features_gpu[:, state_unemp_idx], gathered_state_rates[:, 0])
-        new_feature_vectors_gpu[:, state_emp_idx] = torch.where(nan_mask_state_emp, previous_features_gpu[:, state_emp_idx], gathered_state_rates[:, 1])
+    # Update state rates using gathered values from state_stats_tensor
+    if state_unemp_idx != -1 and state_ids_int_gpu is not None:
+        gathered_state_stats = state_stats_tensor[state_ids_int_gpu] # Shape: (N, 3)
+        nan_mask_state_unemp = torch.isnan(gathered_state_stats[:, 0])
+        new_feature_vectors_gpu[:, state_unemp_idx] = torch.where(nan_mask_state_unemp, previous_features_gpu[:, state_unemp_idx], gathered_state_stats[:, 0])
 
-    # Update industry rates using gathered values
-    if ind_unemp_idx != -1 and ind_emp_idx != -1 and ind_ids_int_gpu is not None:
-        # Gather rates for each individual based on their industry ID index
-        # industry_rates_tensor shape: (num_industries, 2) -> [unemp_rate, emp_rate]
-        gathered_ind_rates = industry_rates_tensor[ind_ids_int_gpu] # Shape: (N, 2)
-        # Handle potential NaNs/Infs
-        nan_mask_ind_unemp = torch.isnan(gathered_ind_rates[:, 0])
-        nan_mask_ind_emp = torch.isnan(gathered_ind_rates[:, 1])
-        new_feature_vectors_gpu[:, ind_unemp_idx] = torch.where(nan_mask_ind_unemp, previous_features_gpu[:, ind_unemp_idx], gathered_ind_rates[:, 0])
-        new_feature_vectors_gpu[:, ind_emp_idx] = torch.where(nan_mask_ind_emp, previous_features_gpu[:, ind_emp_idx], gathered_ind_rates[:, 1])
+    # 4. Update Industry Employment Percentage Change (ind_emp_pctchg) based on LEVELS
+    if ind_emp_pctchg_idx != -1 and ind_ids_int_gpu is not None and previous_industry_emp_levels_tensor is not None:
+        # Get current industry employment level (per industry group)
+        current_industry_emp_levels_tensor = industry_stats_tensor[:, 2] # Shape: (num_industries,)
+
+        # Calculate ratio of levels: current_level / previous_level
+        epsilon = 1e-9
+        industry_emp_level_ratio = torch.where(
+            previous_industry_emp_levels_tensor > epsilon,
+            current_industry_emp_levels_tensor / previous_industry_emp_levels_tensor,
+            torch.tensor(1.0, device=device) # Default to 1.0 if previous level was zero
+        )
+
+        # Gather the ratio for each individual based on their industry ID
+        gathered_ind_emp_pctchg = industry_emp_level_ratio[ind_ids_int_gpu] # Shape: (N,)
+
+        # Handle potential NaNs/Infs resulting from the division
+        nan_inf_mask_pctchg = torch.isnan(gathered_ind_emp_pctchg) | torch.isinf(gathered_ind_emp_pctchg)
+        new_feature_vectors_gpu[:, ind_emp_pctchg_idx] = torch.where(
+            nan_inf_mask_pctchg,
+            torch.tensor(1.0, device=device), # Replace NaN/Inf with 1.0
+            gathered_ind_emp_pctchg
+        )
+    elif ind_emp_pctchg_idx != -1:
+        # If it's the first step (previous levels tensor is None), carry over the value
+        new_feature_vectors_gpu[:, ind_emp_pctchg_idx] = previous_features_gpu[:, ind_emp_pctchg_idx]
+
 
     # --- Industry/Occupation/Class features are carried over implicitly ---
+
+    # --- Update national transition features on GPU ---
+    # derive previous state from flags in previous_features_gpu
+    prev_flags = previous_features_gpu[:, state_indices_values]           # shape (N,3)
+    previous_state_idx = torch.argmax(prev_flags, dim=1)
+    nilf_int = next(k for k,v in target_map_inverse.items() if v.lower() in ['not in labor force','nilf'])
+    w = weights_gpu
+    eps = 1e-9
+    # masks
+    mask_pE = previous_state_idx == employed_int
+    mask_pU = previous_state_idx == unemployed_int
+    mask_pN = previous_state_idx == nilf_int
+    mask_cE = sampled_states_gpu   == employed_int
+    mask_cU = sampled_states_gpu   == unemployed_int
+    mask_cN = sampled_states_gpu   == nilf_int
+    # denominators
+    dE = torch.sum(w[mask_pE]) + eps
+    dU = torch.sum(w[mask_pU]) + eps
+    # dN = torch.sum(w[mask_pN]) + eps # Not needed anymore
+    # transition percents
+    v_EU = torch.sum(w[mask_pE & mask_cU]) / dE
+    v_E_NE = torch.sum(w[mask_pE & mask_cN]) / dE
+    v_UE = torch.sum(w[mask_pU & mask_cE]) / dU
+    v_U_NE = torch.sum(w[mask_pU & mask_cN]) / dU
+    # v_NE_E = torch.sum(w[mask_pN & mask_cE]) / dN # Removed
+    # v_NE_U = torch.sum(w[mask_pN & mask_cU]) / dN # Removed
+    # assign into feature vector if indices exist
+    fi = feature_indices
+    if fi.get('e_u_idx',-1)    >= 0: new_feature_vectors_gpu[:, fi['e_u_idx']]    = v_EU
+    if fi.get('e_ne_idx',-1)   >= 0: new_feature_vectors_gpu[:, fi['e_ne_idx']]   = v_E_NE
+    if fi.get('u_e_idx',-1)    >= 0: new_feature_vectors_gpu[:, fi['u_e_idx']]    = v_UE
+    if fi.get('u_ne_idx',-1)   >= 0: new_feature_vectors_gpu[:, fi['u_ne_idx']]   = v_U_NE
+    # if fi.get('ne_e_idx',-1)   >= 0: new_feature_vectors_gpu[:, fi['ne_e_idx']]   = v_NE_E # Removed
+    # if fi.get('ne_u_idx',-1)   >= 0: new_feature_vectors_gpu[:, fi['ne_u_idx']]   = v_NE_U # Removed
 
     # --- Shift sequences and append ON GPU ---
     # Shift left (remove oldest time step)
@@ -666,6 +722,9 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
         current_sample_sequences_gpu = initial_sequences_tensor.clone() # Already on device
         current_sim_period = initial_period # Reset start period for each sample
 
+        # Initialize previous step's industry employment levels (needed for pctchg calc)
+        previous_industry_emp_levels_tensor = None # Will be set after first step
+
         # --- Inner loop: Iterate through forecast periods for this sample ---
         for i in range(periods_to_forecast):
             # Calculate target period (YYYYMM) for this step (period being predicted)
@@ -707,27 +766,32 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
             )
             sample_period_urs.append(weighted_overall_unemp_rate)
 
-            # 3. Calculate WEIGHTED Group-Specific Rates (State, Industry) using TENSOR function
-            state_rates_tensor = torch.zeros((num_states, 2), device=device) # Default to zeros
+            # 3. Calculate WEIGHTED Group-Specific Stats (State, Industry) using TENSOR function
+            state_stats_tensor = torch.zeros((num_states, 3), device=device) # Shape includes level now
             if state_ids_int_gpu is not None and num_states > 0:
-                state_rates_tensor = calculate_group_rates_tensor(
+                state_stats_tensor = calculate_group_stats_tensor( # Use new function name
                     sampled_states_gpu, current_weights_gpu, state_ids_int_gpu, num_states, metadata
                 )
 
-            industry_rates_tensor = torch.zeros((num_industries, 2), device=device) # Default to zeros
+            industry_stats_tensor = torch.zeros((num_industries, 3), device=device) # Shape includes level now
             if ind_ids_int_gpu is not None and num_industries > 0:
-                 industry_rates_tensor = calculate_group_rates_tensor(
+                 industry_stats_tensor = calculate_group_stats_tensor( # Use new function name
                     sampled_states_gpu, current_weights_gpu, ind_ids_int_gpu, num_industries, metadata
                 )
+
+            # Extract current industry employment levels for the *next* step's calculation
+            current_industry_emp_levels_tensor = industry_stats_tensor[:, 2].clone() if ind_ids_int_gpu is not None else None
 
             # 4. Update this sample's sequences using TENSORIZED function
             current_sample_sequences_gpu = update_sequences_and_features_tensor(
                 current_sequences_tensor=current_sample_sequences_gpu,
                 sampled_states_gpu=sampled_states_gpu,
+                weights_gpu=current_weights_gpu,
                 state_ids_int_gpu=state_ids_int_gpu,
                 ind_ids_int_gpu=ind_ids_int_gpu,
-                state_rates_tensor=state_rates_tensor,
-                industry_rates_tensor=industry_rates_tensor,
+                state_stats_tensor=state_stats_tensor, # Pass full state stats
+                industry_stats_tensor=industry_stats_tensor, # Pass full industry stats
+                previous_industry_emp_levels_tensor=previous_industry_emp_levels_tensor, # Pass previous levels
                 overall_sample_unemp_rate=weighted_overall_unemp_rate,
                 overall_sample_emp_rate=weighted_overall_emp_rate,
                 feature_names=feature_names,
@@ -736,7 +800,10 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
                 feature_indices=feature_indices
             )
 
-            # 5. Advance time for the next period in this sample's simulation
+            # 5. Store current levels as previous for the next iteration
+            previous_industry_emp_levels_tensor = current_industry_emp_levels_tensor # Update for next loop
+
+            # 6. Advance time for the next period in this sample's simulation
             current_sim_period = target_period
 
             # Optional: Clear GPU cache periodically if memory issues arise
@@ -804,6 +871,15 @@ def forecast_multiple_periods_pytorch(initial_sequences_tensor: torch.Tensor, # 
         return forecast_agg_df, pd.DataFrame()
 
 
+# --- New Helper: Calculate Squared Slope Difference ---
+def calculate_slope_error(y_forecast: np.ndarray, y_actual: np.ndarray) -> float:
+    """Fit linear models to forecast vs actual series; return squared difference of slopes."""
+    x = np.arange(len(y_forecast)).reshape(-1, 1)
+    slope_f = LinearRegression().fit(x, y_forecast).coef_[0]
+    slope_a = LinearRegression().fit(x, y_actual).coef_[0]
+    return float((slope_f - slope_a) ** 2)
+
+
 # --- HPT Objective Specific Functions ---
 
 def calculate_hpt_forecast_metrics(model: nn.Module,
@@ -819,21 +895,23 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
     """
     Calculates the HPT objective using the tensor-optimized forecast function.
     Uses the MEAN forecast across hpt_mc_samples for comparison.
+    Returns RMSE, Std Dev, and squared‐slope‐difference (slope_error).
     """
-    print("\n===== Calculating HPT Metric (Forecast RMSE & Std Dev vs National Rates File) =====")
+    print("\n===== Calculating HPT Metrics (RMSE, Std Dev, Slope Error) =====")
     print(f"Using {hpt_mc_samples} MC sample(s) per forecast run.")
+    default_return = {'rmse': float('inf'), 'std_dev': float('inf'), 'slope_error': float('inf')}
     if hpt_val_baked_data is None or hpt_val_baked_data.empty:
-        print("HPT validation baked data is empty. Cannot select start periods.")
-        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
+        return default_return
     if not national_rates_file.exists():
         print(f"ERROR: National rates file not found at {national_rates_file}. Cannot calculate HPT forecast metrics.")
-        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
+        return default_return
     if 'hpt_validation_intervals' not in metadata or not metadata['hpt_validation_intervals']:
         print("ERROR: 'hpt_validation_intervals' not found or empty in metadata. Cannot determine forecast start periods.")
-        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
+        return default_return
 
     model.eval() # Ensure model is in eval mode
-    all_forecast_errors = [] # Store (predicted_rate - actual_rate) for each month across all forecasts
+    all_forecast_errors = []  # Store forecast minus actual errors
+    all_slope_errors = []     # Store SQUARED slope_error for each interval
 
     # --- Load Actual National Rates ---
     try:
@@ -844,14 +922,14 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
         # Calculate period column for merging
         actual_rates_df['period'] = actual_rates_df['date'].dt.year * 100 + actual_rates_df['date'].dt.month
         actual_rates_df.rename(columns={'national_unemp_rate': 'actual_unemployment_rate'}, inplace=True)
-        actual_rates_df = actual_rates_df[['period', 'actual_unemployment_rate']].dropna()
+        actual_rates_df = actual_rates_df[['period', 'actual_unemployment_rate']].dropna().sort_values('period') # Sort for trend calc
         print(f"Loaded actual national rates from {national_rates_file} for {len(actual_rates_df)} periods.")
         if actual_rates_df.empty:
             print("Warning: Loaded actual rates data is empty.")
-            return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
+            return default_return
     except Exception as e:
         print(f"Error loading or processing actual rates file {national_rates_file}: {e}")
-        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
+        return default_return
 
     # --- Determine Start Periods from HPT Intervals in Metadata ---
     hpt_intervals = metadata['hpt_validation_intervals']
@@ -884,11 +962,11 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
 
     except Exception as e:
         print(f"ERROR processing HPT intervals from metadata: {e}")
-        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
+        return default_return
 
     if not start_periods:
         print("ERROR: No valid start periods found based on HPT intervals and available actual rates data.")
-        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
+        return default_return
 
     print(f"Selected start periods for HPT forecast evaluation based on metadata intervals: {start_periods}")
     num_forecasts = len(start_periods) # Number of forecasts is now determined by valid intervals
@@ -951,7 +1029,7 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
 
             # 4. Merge with actual rates (loaded from file) and calculate errors using MEAN forecast
             comparison_df = pd.merge(
-                forecast_agg_df[['period', 'unemployment_rate_forecast']], # Use MEAN forecast column
+                forecast_agg_df[['period', 'unemployment_rate_forecast']].sort_values('period'), # Sort for trend calc
                 actual_rates_df, # Use the dataframe loaded from national_rates_file
                 on='period',
                 how='inner' # Only compare months where both forecast and actual exist
@@ -969,7 +1047,19 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
                 errors = comparison_df['unemployment_rate_forecast'] - comparison_df['actual_unemployment_rate'] # Use MEAN forecast
                 all_forecast_errors.extend(errors.tolist())
                 run_rmse = np.sqrt(mean_squared_error(comparison_df['actual_unemployment_rate'], comparison_df['unemployment_rate_forecast'])) # Use MEAN forecast
-                print(f"  -> Forecast run from {start_period} completed. RMSE for this run: {run_rmse:.6f}")
+
+                # Calculate SQUARED slope error for this run
+                forecast_vals = comparison_df['unemployment_rate_forecast'].values
+                actual_vals = comparison_df['actual_unemployment_rate'].values
+                if len(forecast_vals) > 1 and len(actual_vals) > 1: # Check length again before calling
+                    run_slope_error_squared = calculate_slope_error(forecast_vals, actual_vals) # This returns (slope_f - slope_a)**2
+                else:
+                    print(f"  Warning: Not enough data points ({len(forecast_vals)}) to calculate slope error for start period {start_period}.")
+                    run_slope_error_squared = float('inf') # Assign inf if cannot calculate
+
+                all_slope_errors.append(run_slope_error_squared)  # Store the SQUARED slope error for this run
+
+                print(f"  -> Forecast run from {start_period} completed. RMSE: {run_rmse:.6f}, Squared Slope Error: {run_slope_error_squared:.6f}") # Updated print
             else:
                  print(f"  -> Forecast run from {start_period} - No matching actual data found for comparison in national rates file.")
 
@@ -984,19 +1074,28 @@ def calculate_hpt_forecast_metrics(model: nn.Module,
             import traceback
             traceback.print_exc()
             # Continue to next start period if possible, but the final RMSE might be unreliable
+            all_slope_errors.append(float('inf')) # Add inf if run failed
 
     # --- Calculate Final Metrics ---
     if not all_forecast_errors:
         print("ERROR: No forecast errors collected across all runs. Cannot calculate final metrics.")
-        return {'rmse': float('inf'), 'std_dev': float('inf')} # Changed variance to std_dev
+        return default_return # Return dict with inf values
 
     final_rmse = np.sqrt(np.mean(np.square(all_forecast_errors)))
     final_std_dev = np.std(all_forecast_errors) # Calculate standard deviation
-    print(f"\nCalculated Final HPT Metrics (RMSE and Std Dev over {len(all_forecast_errors)} months across {num_forecasts} forecasts):")
-    print(f"  RMSE: {final_rmse:.6f}")
-    print(f"  Std Dev: {final_std_dev:.6f}") # Print standard deviation
 
-    return {'rmse': final_rmse, 'std_dev': final_std_dev} # Return std_dev
+    # Calculate the ROOT MEAN SQUARE of the slope errors across all successful forecast runs
+    valid_squared_slopes = [e for e in all_slope_errors if not np.isinf(e) and not np.isnan(e)]
+    # Calculate the square root of the mean of the squared errors
+    final_slope_error = np.sqrt(np.mean(valid_squared_slopes)) if valid_squared_slopes else float('inf') # Changed calculation
+
+    print(f"\nCalculated Final HPT Metrics (over {len(all_forecast_errors)} months across {num_forecasts} forecasts):")
+    print(f"  RMSE: {final_rmse:.6f}")
+    print(f"  Std Dev: {final_std_dev:.6f}")
+    print(f"  Root Mean Squared Slope Error: {final_slope_error:.6f}") # Updated print description
+
+    # Return the Root Mean Squared Slope Error under the 'slope_error' key
+    return {'rmse': final_rmse, 'std_dev': final_std_dev, 'slope_error': final_slope_error}
 
 
 # --- Standard Evaluation Function (from training script) ---

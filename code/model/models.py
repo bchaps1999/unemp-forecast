@@ -72,6 +72,7 @@ class TransformerForecastingModel(nn.Module):
 
         # Positional Embedding
         self.pos_embedding = PositionalEmbedding(seq_len, embed_dim)
+        self.layernorm_embed = nn.LayerNorm(embed_dim) # Added LayerNorm after positional embedding
         self.input_dropout = nn.Dropout(dropout)
 
         # Transformer Blocks
@@ -105,6 +106,7 @@ class TransformerForecastingModel(nn.Module):
 
         # Add positional embedding
         x = self.pos_embedding(x)
+        x = self.layernorm_embed(x) # Apply LayerNorm after positional embedding
         x = self.input_dropout(x)
 
         # Pass through Transformer blocks

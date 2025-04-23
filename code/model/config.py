@@ -23,7 +23,7 @@ PREPROCESS_END_DATE = None   # "YYYY-MM-DD" or None
 # Sampling for FINAL training/validation splits (after HPT)
 PREPROCESS_NUM_INDIVIDUALS_FULL = 1000000 # Integer or None for all individuals before TRAIN_END_DATE (excluding HPT intervals)
 # Sampling for HPT training/validation splits (during HPT)
-PREPROCESS_NUM_INDIVIDUALS_HPT = 200000 # Integer or None for all individuals before HPT intervals
+PREPROCESS_NUM_INDIVIDUALS_HPT = 100000 # Integer or None for all individuals before HPT intervals
 TRAIN_SPLIT = 0.7
 VAL_SPLIT = 0.15
 # Test split is implicitly 1 - TRAIN_SPLIT - VAL_SPLIT
@@ -85,6 +85,9 @@ HPT_EPOCHS = 3 # Number of epochs to run during hyperparameter tuning trials
 FOCAL_LOSS_GAMMA = 2.0 # Focusing parameter for Focal Loss (0 means standard CE)
 TRANSITION_WEIGHT_FACTOR = 0.0 # Factor (0-1) to interpolate between no sample weight (0) and inverse frequency transition weights (1). Default 0.
 
+# Optimizer regularization
+WEIGHT_DECAY = 1e-5  # L2 penalty for Adam
+
 # Training Flags
 REFRESH_MODEL = False # Force retraining even if model exists
 REFRESH_SEQUENCES = False # Force regeneration of sequences even if cache exists
@@ -95,45 +98,46 @@ DEBUG_MODE = False # Enable debug mode (minimal usage currently)
 PARALLEL_WORKERS = -1 # Set to specific number (e.g., 4) or -1 for auto
 
 # --- Hyperparameter Tuning (HPT) Parameters ---
-HPT_N_TRIALS = 100 # Number of trials for Optuna
+# Number of trials for Optuna
+HPT_N_TRIALS = 100
 HPT_TIMEOUT_SECONDS = None # Optional timeout for the entire study (e.g., 3600 * 6 for 6 hours)
 HPT_STUDY_NAME = "transformer_hpt_study" # Name for the Optuna study database file
 # HPT_EPOCHS defined above
-HPT_OBJECTIVE_METRIC = 'rmse' # Choose 'rmse' or 'std_dev' to minimize
+HPT_OBJECTIVE_TYPE = 'slope_error' # Choose 'rmse', 'std_dev', 'slope_error', or 'combined'
 HPT_FORECAST_HORIZON = 12 # Number of months to forecast in HPT objective calculation
 HPT_RESULTS_CSV = "hpt_results.csv" # Filename for HPT results log within study dir
 BEST_HPARAMS_PKL = "best_hparams.pkl" # Filename for best HPT params within study dir
 
-# HPT Search Space Definitions
+# Combined Objective Parameters (used when HPT_OBJECTIVE_TYPE = 'combined')
+HPT_PRIMARY_WEIGHT = 0.5 # Weight for primary metric in combined objective
+HPT_PRIMARY_METRIC = 'rmse'       # Primary metric: 'rmse', 'std_dev', or 'slope_error'
+HPT_SECONDARY_METRIC = 'slope_error' # Secondary metric: 'rmse', 'std_dev', or 'slope_error'
+
+# Tunable hyperparameters below.  Dropout and MLP-dropout are fixed at 0.1/0.2.
 HPT_EMBED_DIM_OPTIONS = [32, 64, 128]
-HPT_NUM_HEADS_OPTIONS = [2, 4, 8] # Must divide embed_dim
+HPT_NUM_HEADS_OPTIONS = [2, 4, 8]
 HPT_FF_DIM_MIN = 32
 HPT_FF_DIM_MAX = 256
 HPT_FF_DIM_STEP = 32
 HPT_NUM_BLOCKS_MIN = 1
-HPT_NUM_BLOCKS_MAX = 6 # Increased from 4
-HPT_MLP_UNITS_MIN = 16 # For the single layer MLP head example
+HPT_NUM_BLOCKS_MAX = 6
+HPT_MLP_UNITS_MIN = 16
 HPT_MLP_UNITS_MAX = 128
 HPT_MLP_UNITS_STEP = 16
-HPT_DROPOUT_MIN = 0.0
-HPT_DROPOUT_MAX = 0.3
-HPT_MLP_DROPOUT_MIN = 0.0
-HPT_MLP_DROPOUT_MAX = 0.6 # Increased from 0.5
 HPT_LR_MIN = 1e-5
 HPT_LR_MAX = 1e-3
-HPT_BATCH_SIZE_OPTIONS = [32, 64, 128, 256] # Added 256
-# Add search space for Focal Loss gamma
-HPT_FOCAL_LOSS_GAMMA_MIN = 0.0 # Gamma=0 is equivalent to CrossEntropy
+HPT_BATCH_SIZE_OPTIONS = [32, 64, 128, 256]
+HPT_FOCAL_LOSS_GAMMA_MIN = 0.0
 HPT_FOCAL_LOSS_GAMMA_MAX = 5.0
-# Add search space for transition weight factor
-HPT_TRANSITION_WEIGHT_FACTOR_MIN = 0.0 # 0 = no transition weighting
-HPT_TRANSITION_WEIGHT_FACTOR_MAX = 1.0 # 1 = full inverse frequency transition weighting
+HPT_TRANSITION_WEIGHT_FACTOR_MIN = 0.0
+HPT_TRANSITION_WEIGHT_FACTOR_MAX = 1.0
+HPT_WEIGHT_DECAY_MIN = 1e-8
+HPT_WEIGHT_DECAY_MAX = 1e-3
 
 # HPT Pruner Settings
-HPT_PRUNER_STARTUP = 5 # Number of trials before pruning starts
-HPT_PRUNER_WARMUP = 3 # Number of epochs within a trial before pruning can occur
-# Add HPT MC Samples
-HPT_MC_SAMPLES = 3 # Number of MC samples for forecast during HPT objective calculation (can increase for stability)
+HPT_PRUNER_STARTUP = 5
+HPT_PRUNER_WARMUP = 3
+HPT_MC_SAMPLES = 3
 
 # --- 03_forecast_transformer.py Parameters ---
 # Input directory for baked data is PREPROCESS_OUTPUT_DIR
